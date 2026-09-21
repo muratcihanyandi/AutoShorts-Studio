@@ -1,0 +1,17 @@
+lib/
+.codebase-memory/
+*.exe
+*.dll
+*.ttc
+*.mp4
+*.zip
+*.tar.gz
+MoneyPrinterTurbo/storage/
+MoneyPrinterTurbo/venv/
+MoneyPrinterTurbo/.venv/
+MoneyPrinterTurbo/node_modules/
+MoneyPrinterTurbo/resource/client_secret.json
+MoneyPrinterTurbo/resource/youtube_token.json
+MoneyPrinterTurbo/__pycache__/
+MoneyPrinterTurbo/logs/
+MoneyPrinterTurbo/test_dir/
