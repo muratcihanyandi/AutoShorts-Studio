@@ -37,4 +37,4 @@ if not "%SELECTED_WEBUI_PORT%"=="%MPT_WEBUI_PORT%" (
 set "MPT_WEBUI_PORT=%SELECTED_WEBUI_PORT%"
 
 echo ***** WebUI address: http://%MPT_WEBUI_HOST%:%MPT_WEBUI_PORT% *****
-%CURRENT_DIR%lib\python\python.exe -m streamlit run %CURRENT_DIR%MoneyPrinterTurbo\webui\Main.py --server.address=%MPT_WEBUI_HOST% --server.port=%MPT_WEBUI_PORT% --browser.serverAddress=%MPT_WEBUI_HOST% --browser.gatherUsageStats=False --server.enableCORS=True
+%CURRENT_DIR%lib\python\python.exe -m streamlit run %CURRENT_DIR%AutoShortsStudio\webui\Main.py --server.address=%MPT_WEBUI_HOST% --server.port=%MPT_WEBUI_PORT% --browser.serverAddress=%MPT_WEBUI_HOST% --browser.gatherUsageStats=False --server.enableCORS=True
