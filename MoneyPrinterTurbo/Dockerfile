@@ -2,12 +2,12 @@
 FROM python:3.11-slim-bullseye
 
 # Set the working directory in the container
-WORKDIR /MoneyPrinterTurbo
+WORKDIR /AutoShortsStudio
 
-# 设置/MoneyPrinterTurbo目录权限为777
-RUN chmod 777 /MoneyPrinterTurbo
+# Set permissions
+RUN chmod 777 /AutoShortsStudio
 
-ENV PYTHONPATH="/MoneyPrinterTurbo"
+ENV PYTHONPATH="/AutoShortsStudio"
 
 # 本地用户默认继续优先使用国内镜像；GitHub Actions 发布 GHCR 镜像时使用 default，
 # 避免海外 runner 访问国内镜像过慢导致镜像发布长时间卡住。
@@ -73,10 +73,10 @@ EXPOSE 8501
 CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False"]
 
 # 1. Build the Docker image using the following command
-# docker build -t moneyprinterturbo .
+# docker build -t autoshorts-studio .
 
 # 2. Run the Docker container using the following command
 ## For Linux or MacOS:
-# docker run -v $(pwd)/config.toml:/MoneyPrinterTurbo/config.toml -v $(pwd)/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
+# docker run -v $(pwd)/config.toml:/AutoShortsStudio/config.toml -v $(pwd)/storage:/AutoShortsStudio/storage -p 127.0.0.1:8501:8501 autoshorts-studio
 ## For Windows:
-# docker run -v ${PWD}/config.toml:/MoneyPrinterTurbo/config.toml -v ${PWD}/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
+# docker run -v ${PWD}/config.toml:/AutoShortsStudio/config.toml -v ${PWD}/storage:/AutoShortsStudio/storage -p 127.0.0.1:8501:8501 autoshorts-studio

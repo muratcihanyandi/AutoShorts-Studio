@@ -19,9 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-PROJECT_ARCHIVE_URL = (
-    "https://github.com/harry0703/MoneyPrinterTurbo/archive/refs/heads/main.zip"
-)
+PROJECT_ARCHIVE_URL = ""
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
 DEFAULT_VOICE_NAME = "zh-CN-XiaoxiaoNeural-Female"
 NEEDS_INPUT_EXIT_CODE = 10

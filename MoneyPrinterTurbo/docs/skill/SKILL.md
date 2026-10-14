@@ -3,9 +3,7 @@ name: moneyprinterturbo-video
 description: Use this skill whenever the user wants to create a finished video from a topic, title, idea, prompt, or script with MoneyPrinterTurbo. This includes short-form, voice-over, educational, marketing, social-media, and stock-footage videos. Also use it when the user mentions MoneyPrinterTurbo, provides this Skill URL, asks an AI agent to install or configure MoneyPrinterTurbo, needs missing API keys identified, wants a failed generation repaired, or wants a generated MP4 located and delivered. Use this skill when the expected outcome is a final video file, not setup instructions.
 compatibility: Requires an AI agent with terminal, network, filesystem, and long-running command support. Supports macOS and Windows and uses uv exclusively.
 metadata:
-  author: "harry0703@hotmail.com"
   version: "1.3.2"
-  upstream: "https://github.com/harry0703/MoneyPrinterTurbo"
 ---
 
 # MoneyPrinterTurbo Video Generation
@@ -34,11 +32,7 @@ Resolve `SKILL_DIR` from this `SKILL.md` file. The helper is the adjacent `mpt_a
 
 This is required on Windows because some agent terminal validators remove backslashes from absolute paths embedded in commands. Using `mpt_agent.py` with `workdir=SKILL_DIR` avoids that failure and works on both macOS and Windows.
 
-If the client loaded only the remote `SKILL.md`, download the helper from the official repository to a temporary directory, then use that temporary directory as the command working directory:
-
-```text
-https://raw.githubusercontent.com/harry0703/MoneyPrinterTurbo/main/docs/skill/mpt_agent.py
-```
+If the client loaded only `SKILL.md`, use the local helper located at `docs/skill/mpt_agent.py`:
 
 ### 2. Run the helper
 

@@ -14,6 +14,21 @@ from app.services import version_checker
 class TestVersionChecker(unittest.TestCase):
     """验证版本比较和 GitHub 检查异常不会影响主流程。"""
 
+    def setUp(self):
+        self._orig_api_url = version_checker.LATEST_RELEASE_API_URL
+        self._orig_page_url = version_checker.LATEST_RELEASE_PAGE_URL
+        version_checker.LATEST_RELEASE_API_URL = "https://api.github.com/repos/example/AutoShortsStudio/releases/latest"
+        version_checker.LATEST_RELEASE_PAGE_URL = "https://github.com/example/AutoShortsStudio/releases/latest"
+
+    def tearDown(self):
+        version_checker.LATEST_RELEASE_API_URL = self._orig_api_url
+        version_checker.LATEST_RELEASE_PAGE_URL = self._orig_page_url
+
+    def test_disabled_release_api_url_returns_none(self):
+        version_checker.LATEST_RELEASE_API_URL = ""
+        result = version_checker.get_available_update("1.3.2")
+        self.assertIsNone(result)
+
     @staticmethod
     def _response(tag_name):
         response = MagicMock()

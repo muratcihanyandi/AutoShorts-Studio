@@ -466,10 +466,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         config.app["llm_provider"] = "ernie"
 
         with patch.object(llm, "OpenAI") as openai_client:
-            result = llm._generate_response("test")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("test")
 
         openai_client.assert_not_called()
-        self.assertIn("unsupported llm provider", result)
+        self.assertIn("unsupported llm provider", str(ctx.exception))
 
     def test_pollinations_requires_api_key_before_request(self):
         """新统一 API 要求鉴权，缺少 Key 时不得发送匿名生成请求。"""
@@ -483,10 +484,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
 
         with patch.object(llm, "OpenAI") as openai_client:
-            result = llm._generate_response("test")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("test")
 
         openai_client.assert_not_called()
-        self.assertIn("api_key is not set", result)
+        self.assertIn("api_key is not set", str(ctx.exception))
 
     def test_pollinations_uses_unified_openai_compatible_api(self):
         """历史地址和模型名应自动迁移，并通过统一 Chat Completions API 调用。"""
@@ -583,10 +585,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
 
         with patch.object(llm, "OpenAI") as openai_client:
-            result = llm._generate_response("test")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("test")
 
         openai_client.assert_not_called()
-        self.assertIn("account_id is not set", result)
+        self.assertIn("account_id is not set", str(ctx.exception))
 
     def test_cloudflare_uses_ai_gateway_openai_endpoint(self):
         """Cloudflare Provider 必须走 AI Gateway，不再调用 Workers AI 接口。"""
@@ -699,10 +702,10 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
 
         with patch.dict(sys.modules, {"litellm": fake_litellm}):
-            result = llm._generate_response("test")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("returned empty response", result)
+        self.assertIn("returned empty response", str(ctx.exception))
 
     def test_litellm_provider_handles_empty_message(self):
         """
@@ -719,10 +722,10 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
 
         with patch.dict(sys.modules, {"litellm": fake_litellm}):
-            result = llm._generate_response("test")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("returned empty message", result)
+        self.assertIn("returned empty message", str(ctx.exception))
 
     def test_sanitize_error_message_redacts_url_credentials_and_query_tokens(self):
         message = (
@@ -768,14 +771,14 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
 
         with patch.object(llm, "OpenAI", return_value=fake_client):
-            result = llm._generate_response("test")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("https://***:***@proxy.example.com", result)
-        self.assertIn("access_token=***", result)
-        self.assertNotIn("myuser", result)
-        self.assertNotIn("mypassword", result)
-        self.assertNotIn("secret-token", result)
+        self.assertIn("https://***:***@proxy.example.com", str(ctx.exception))
+        self.assertIn("access_token=***", str(ctx.exception))
+        self.assertNotIn("myuser", str(ctx.exception))
+        self.assertNotIn("mypassword", str(ctx.exception))
+        self.assertNotIn("secret-token", str(ctx.exception))
 
     def test_openai_provider_still_uses_existing_path(self):
         config.app["llm_provider"] = "openai"
@@ -783,11 +786,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         config.app["openai_base_url"] = "https://api.openai.com/v1"
         config.app["openai_model_name"] = "gpt-4o-mini"
 
-        result = llm._generate_response("test")
+        with self.assertRaises(LLMGenerationError) as ctx:
+            llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("api_key is not set", result)
-        self.assertNotIn("litellm", result.lower())
+        self.assertIn("api_key is not set", str(ctx.exception))
+        self.assertNotIn("litellm", str(ctx.exception).lower())
 
     def _use_qwen_provider(self):
         config.app["llm_provider"] = "qwen"
@@ -854,11 +857,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         }
 
         with self._patch_dashscope_generation(response):
-            result = llm._generate_response("Say hello")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("Say hello")
 
-        self.assertIn("Error:", result)
-        self.assertIn("returned empty text content", result)
-        self.assertNotIn("NoneType", result)
+        self.assertIn("returned empty text content", str(ctx.exception))
+        self.assertNotIn("NoneType", str(ctx.exception))
 
     def test_qwen_provider_reports_empty_choices(self):
         """Qwen chat 响应 choices 为空时应返回明确错误。"""
@@ -866,11 +869,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         response = {"output": {"text": None, "choices": []}}
 
         with self._patch_dashscope_generation(response):
-            result = llm._generate_response("Say hello")
+            with self.assertRaises(LLMGenerationError) as ctx:
+                llm._generate_response("Say hello")
 
-        self.assertIn("Error:", result)
-        self.assertIn("returned empty choices", result)
-        self.assertNotIn("NoneType", result)
+        self.assertIn("returned empty choices", str(ctx.exception))
+        self.assertNotIn("NoneType", str(ctx.exception))
 
     def test_aihubmix_provider_uses_openai_compatible_client(self):
         """
@@ -1041,11 +1044,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         config.app["grok_base_url"] = "https://api.x.ai/v1"
         config.app["grok_model_name"] = "grok-4.3"
 
-        result = llm._generate_response("test")
+        with self.assertRaises(LLMGenerationError) as ctx:
+            llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("api_key is not set", result)
-        self.assertNotIn("litellm", result.lower())
+        self.assertIn("api_key is not set", str(ctx.exception))
+        self.assertNotIn("litellm", str(ctx.exception).lower())
 
     def test_groq_provider_requires_api_key(self):
         config.app["llm_provider"] = "groq"
@@ -1053,11 +1056,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         config.app["groq_base_url"] = "https://api.groq.com/openai/v1"
         config.app["groq_model_name"] = "llama-3.3-70b-versatile"
 
-        result = llm._generate_response("test")
+        with self.assertRaises(LLMGenerationError) as ctx:
+            llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("api_key is not set", result)
-        self.assertNotIn("litellm", result.lower())
+        self.assertIn("api_key is not set", str(ctx.exception))
+        self.assertNotIn("litellm", str(ctx.exception).lower())
 
     def test_groq_provider_uses_default_base_url(self):
         config.app["llm_provider"] = "groq"
@@ -1266,10 +1269,10 @@ class TestLiteLLMProvider(unittest.TestCase):
     def test_unsupported_provider_returns_clear_error(self):
         config.app["llm_provider"] = "g" + "4f"
 
-        result = llm._generate_response("test")
+        with self.assertRaises(llm.LLMGenerationError) as ctx:
+            llm._generate_response("test")
 
-        self.assertIn("Error:", result)
-        self.assertIn("unsupported llm provider", result)
+        self.assertIn("unsupported llm provider", str(ctx.exception).lower())
 
 
 class TestRuntimeEnvironmentDetection(unittest.TestCase):

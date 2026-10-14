@@ -424,6 +424,11 @@ def test_connection() -> tuple[bool, str, float]:
         logger.warning(f"llm connection test failed: {error_message}")
         return False, error_message, elapsed
 
+    if response.startswith("Error:"):
+        err = response.replace("Error:", "").strip()
+        logger.warning(f"llm connection test failed: {err}")
+        return False, err, elapsed
+
     logger.info(f"llm connection test succeeded, elapsed: {elapsed:.2f}s")
     return True, "", elapsed
 
@@ -675,6 +680,9 @@ Please note that you must use English for generating video search terms; Chinese
     for i in range(_max_retries):
         try:
             response = _generate_response(prompt)
+            if response and response.startswith("Error:"):
+                logger.warning(f"provider returned error in generate_terms: {response}")
+                return []
             search_terms = json.loads(_strip_code_fence(response))
             if not isinstance(search_terms, list) or not all(
                 isinstance(term, str) for term in search_terms
@@ -983,8 +991,111 @@ def generate_social_metadata(
             )
 
     if last_error:
-        raise last_error
-    raise LLMGenerationError("Failed to generate social metadata")
+        logger.warning(
+            f"failed to generate social metadata via LLM ({last_error}), falling back to heuristic metadata"
+        )
+        return _fallback_social_metadata(video_subject, video_script, platform)
+
+    return _fallback_social_metadata(video_subject, video_script, platform)
+
+
+# ================= OpenShorts Viral Moment Secimi =================
+
+def _fallback_viral_moment(total_duration: float, video_title: str = "", channel_name: str = "") -> dict:
+    mid = max(0.0, (total_duration - 40.0) / 2.0)
+    hook = f"{channel_name}: {video_title}" if channel_name else video_title
+    if not hook:
+        hook = "En Çarpıcı An 💥"
+    else:
+        hook = f"{hook[:45]} 💥"
+    return {
+        "start_sec": round(mid, 2),
+        "end_sec": round(min(total_duration, mid + 40.0), 2),
+        "viral_hook_text": hook,
+        "youtube_title": f"{hook} #shorts",
+        "viral_score": 7,
+        "reason": "Heuristic fallback"
+    }
+
+
+def generate_viral_moment_selection(
+    transcript_with_timestamps: str,
+    total_duration: float,
+    channel_name: str = "",
+    video_title: str = "",
+    min_window: float = 25.0,
+    max_window: float = 55.0,
+) -> dict:
+    """
+    OpenShorts transkript pencereli viral an analizi:
+    LLM'i kullanarak transkriptten izleyiciyi en cok tutacak 25-55 saniyelik bolumu,
+    dikkat cekici kanca (hook) metnini ve YouTube Shorts basligini tespit eder.
+    """
+    if not transcript_with_timestamps or not transcript_with_timestamps.strip():
+        return _fallback_viral_moment(total_duration, video_title, channel_name)
+
+    prompt = f"""
+Sen YouTube Shorts, TikTok ve Instagram Reels alaninda uzmanlasmis viral bir video editorusun.
+Asagida bir yayinciya veya videoya ait zaman damgali transkript yer aliyor.
+
+Video Basligi: {video_title or 'Bilinmiyor'}
+Yayinci / Kanal: {channel_name or 'Bilinmiyor'}
+Toplam Sure: {total_duration:.1f} saniye
+
+ZAMAN DAMGALI TRANSKRIPT:
+\"\"\"
+{transcript_with_timestamps[:6000]}
+\"\"\"
+
+GOREVIN:
+1. Bu transkript icindeki en komik, en heyecanli, merak uyandirici veya duygusal patlama yasanan {min_window:.0f}-{max_window:.0f} saniyelik TEK BIR viral anı sec.
+2. Baslangic (start_sec) ve bitis (end_sec) saniyelerini tam sayisal deger olarak belirle (0 <= start_sec < end_sec <= {total_duration:.1f}).
+3. Bu klibin tepesinde gorunecek, kullanicilarin kaydirmasini onleyecek 5-9 kelimelik carpici bir KANCA BASLIGI (viral_hook_text) yaz (1-2 emoji ekle, ornegin: "Rraenee sinir krizi geçirdi 💀" veya "Bunu hiç beklemiyordu 😱").
+4. 80 karakteri asmayan, tiklama orani yuksek bir YouTube Shorts basligi yaz (youtube_title).
+5. Klibe 1-10 arasi bir viral potansiyel puani ver (viral_score).
+
+YALNIZCA asagidaki JSON formatinda yanit ver, baska hicbir aciklama yazma:
+{{
+  "start_sec": 12.5,
+  "end_sec": 48.0,
+  "viral_hook_text": "Kanca metni burada 🚀",
+  "youtube_title": "YouTube Basligi #shorts",
+  "viral_score": 9,
+  "reason": "Neden viral olacagi"
+}}
+""".strip()
+
+    logger.info(f"Analyzing transcript for viral moments via LLM (video_duration={total_duration:.1f}s)")
+    for i in range(_max_retries):
+        try:
+            raw = _generate_response(prompt)
+            cleaned = _strip_code_fence(raw)
+            match = re.search(r"\{.*\}", cleaned or "", re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                start_sec = float(data.get("start_sec", 0.0))
+                end_sec = float(data.get("end_sec", min(total_duration, start_sec + 40.0)))
+                # Sınır kontrolleri
+                start_sec = max(0.0, min(start_sec, total_duration - 5.0))
+                end_sec = min(total_duration, max(start_sec + 10.0, end_sec))
+                hook = str(data.get("viral_hook_text", "")).strip() or (video_title[:45] + " 🔥")
+                title = str(data.get("youtube_title", "")).strip() or f"{hook} #shorts"
+                score = int(data.get("viral_score", 8))
+
+                logger.success(f"Viral moment selected: {start_sec:.1f}s - {end_sec:.1f}s (Score: {score}) Hook: '{hook}'")
+                return {
+                    "start_sec": round(start_sec, 2),
+                    "end_sec": round(end_sec, 2),
+                    "viral_hook_text": hook,
+                    "youtube_title": title,
+                    "viral_score": score,
+                    "reason": str(data.get("reason", ""))
+                }
+        except Exception as e:
+            logger.warning(f"Failed to generate/parse viral moment on attempt {i+1}: {e}")
+
+    logger.warning("LLM viral moment selection failed, falling back to heuristic")
+    return _fallback_viral_moment(total_duration, video_title, channel_name)
 
 
 if __name__ == "__main__":

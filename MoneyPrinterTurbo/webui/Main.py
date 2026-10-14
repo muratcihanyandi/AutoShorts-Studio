@@ -50,18 +50,15 @@ from app.services import version_checker
 from app.services.youtube_uploader import youtube_uploader_service
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
+from webui.views.clips_automation_view import render_clips_automation_tab
 
 st.set_page_config(
-    page_title="MoneyPrinterTurbo",
-    page_icon="🤖",
+    page_title="AutoShorts Studio",
+    page_icon="🎬",
     layout="wide",
     initial_sidebar_state="auto",
     menu_items={
-        "Report a bug": "https://github.com/harry0703/MoneyPrinterTurbo/issues",
-        "About": "# MoneyPrinterTurbo\nSimply provide a topic or keyword for a video, and it will "
-        "automatically generate the video copy, video materials, video subtitles, "
-        "and video background music before synthesizing a high-definition short "
-        "video.\n\nhttps://github.com/harry0703/MoneyPrinterTurbo",
+        "About": "# AutoShorts Studio\nAI Video Generator & Streamer Clips Automation Platform.",
     },
 )
 
@@ -1076,13 +1073,8 @@ def _render_brand(available_update: str | None = None):
     st.markdown(
         f"""
         <h1 class="mpt-brand">
-            <span class="mpt-brand__name">MoneyPrinterTurbo</span>
-            <a class="mpt-brand__version"
-               href="https://github.com/harry0703/MoneyPrinterTurbo"
-               target="_blank"
-               rel="noopener noreferrer"
-               aria-label="Open MoneyPrinterTurbo on GitHub"
-               title="Open project on GitHub">v{html.escape(str(config.project_version))}</a>
+            <span class="mpt-brand__name">AutoShorts Studio</span>
+            <span class="mpt-brand__version">v{html.escape(str(config.project_version))}</span>
             {update_link}
         </h1>
         """,
@@ -1404,11 +1396,11 @@ def _render_generation_task_snapshot(task_id, task):
     with col1:
         cross_post_state = task.get("cross_post_state")
         if cross_post_state == const.CROSS_POST_STATE_FAILED:
-            st.error(task.get("cross_post_error") or tr("YouTube/Platform Upload Failed"))
+            st.error(task.get("cross_post_error") or "YouTube/Platform Upload Failed")
         elif cross_post_state == const.CROSS_POST_STATE_COMPLETE:
-            st.success(tr("Uploaded Successfully"))
+            st.success("Uploaded Successfully")
         elif cross_post_state == const.CROSS_POST_STATE_PROCESSING:
-            st.info(tr("Uploading..."))
+            st.info("Uploading...")
             
     with col2:
         if st.button("YouTube/Tiktok'a Yükle (Yeniden Dene)", key=f"retry_crosspost_{task_id}"):
@@ -2345,8 +2337,8 @@ def _render_script_settings(panel, params):
                             st.session_state["video_script"] = script
                             st.session_state["video_terms"] = ", ".join(terms)
                         except LLMGenerationError as e:
-                            st.error(tr("Metin üretimi sırasında LLM API'sinden bir hata alındı. Lütfen API anahtarınızı veya kullanım kotanızı kontrol edin."))
-                            with st.expander(tr("Hata Detayları")):
+                            st.error("Metin üretimi sırasında LLM API'sinden bir hata alındı. Lütfen API anahtarınızı veya kullanım kotanızı kontrol edin.")
+                            with st.expander("Hata Detayları"):
                                 st.code(str(e))
             params.video_script = st.text_area(
                 tr("Video Script"),
@@ -2377,8 +2369,8 @@ def _render_script_settings(panel, params):
                                 )
                             st.session_state["video_terms"] = ", ".join(terms)
                         except LLMGenerationError as e:
-                            st.error(tr("Metin üretimi sırasında LLM API'sinden bir hata alındı. Lütfen API anahtarınızı veya kullanım kotanızı kontrol edin."))
-                            with st.expander(tr("Hata Detayları")):
+                            st.error("Metin üretimi sırasında LLM API'sinden bir hata alındı. Lütfen API anahtarınızı veya kullanım kotanızı kontrol edin.")
+                            with st.expander("Hata Detayları"):
                                 st.code(str(e))
 
             params.video_terms = st.text_area(
@@ -4125,52 +4117,61 @@ def _render_application():
     if restore_applied or restore_succeeded:
         st.success(tr("Task Configuration Loaded"))
 
-    with st.container(key="main_settings_grid"):
-        panel = st.columns(4)
-    left_panel = panel[0]
-    middle_panel = panel[1]
-    audio_panel = panel[2]
-    right_panel = panel[3]
+    tab_video_gen, tab_clips_auto = st.tabs([
+        "🎬 AI Video Oluşturucu (AutoShorts)",
+        "⚡ Yayıncı Klip & Shorts Otomasyonu (YouTube / Twitch / Kick)"
+    ])
 
-    params = VideoParams(video_subject="")
-    params.match_materials_to_script = bool(
-        st.session_state.get("match_materials_to_script", False)
-    )
-    _render_script_settings(left_panel, params)
+    with tab_video_gen:
+        with st.container(key="main_settings_grid"):
+            panel = st.columns(4)
+        left_panel = panel[0]
+        middle_panel = panel[1]
+        audio_panel = panel[2]
+        right_panel = panel[3]
 
-    uploaded_files = _render_video_settings(middle_panel, params)
-    uploaded_audio_file, uploaded_bgm_file, voice_mode = _render_audio_settings(
-        audio_panel, params
-    )
+        params = VideoParams(video_subject="")
+        params.match_materials_to_script = bool(
+            st.session_state.get("match_materials_to_script", False)
+        )
+        _render_script_settings(left_panel, params)
 
-    _render_subtitle_settings(right_panel, params)
+        uploaded_files = _render_video_settings(middle_panel, params)
+        uploaded_audio_file, uploaded_bgm_file, voice_mode = _render_audio_settings(
+            audio_panel, params
+        )
 
-    generation_submitted = _render_generation_controls(
-        params,
-        uploaded_files,
-        uploaded_audio_file,
-        uploaded_bgm_file,
-        voice_mode,
-    )
+        _render_subtitle_settings(right_panel, params)
 
-    # 生成分支在启动后台线程前已经保存过配置。这里再次保存既没有收益，还可能
-    # 与持有 runtime_config_lock 的长任务竞争，使当前 Streamlit 脚本一直阻塞
-    # 到视频完成，进而让日志 Fragment 无法运行。普通页面交互仍保留统一保存。
-    if not generation_submitted:
-        config.ui["video_clip_duration"] = params.video_clip_duration
-        config.ui["video_clip_speed"] = params.video_clip_speed
-        config.ui["video_count"] = params.video_count
-        config.ui["video_aspect"] = params.video_aspect
-        config.ui["video_concat_mode"] = params.video_concat_mode
-        config.ui["video_transition_mode"] = params.video_transition_mode
-        config.ui["match_materials_to_script"] = params.match_materials_to_script
-        config.ui["voice_rate"] = params.voice_rate
-        config.ui["voice_volume"] = params.voice_volume
-        config.ui["bgm_type"] = params.bgm_type
-        config.ui["bgm_volume"] = params.bgm_volume
-        config.ui["paragraph_number"] = params.paragraph_number
-        config.ui["target_duration_minutes"] = getattr(params, "target_duration_minutes", 0.0)
-        config.save_config()
+        generation_submitted = _render_generation_controls(
+            params,
+            uploaded_files,
+            uploaded_audio_file,
+            uploaded_bgm_file,
+            voice_mode,
+        )
+
+        # 生成分支在启动后台线程前已经保存过配置。这里再次保存既没有收益，还可能
+        # 与持有 runtime_config_lock 的长任务竞争，使当前 Streamlit 脚本一直阻塞
+        # 到视频完成，进而让日志 Fragment 无法运行。普通页面交互仍保留统一保存。
+        if not generation_submitted:
+            config.ui["video_clip_duration"] = params.video_clip_duration
+            config.ui["video_clip_speed"] = params.video_clip_speed
+            config.ui["video_count"] = params.video_count
+            config.ui["video_aspect"] = params.video_aspect
+            config.ui["video_concat_mode"] = params.video_concat_mode
+            config.ui["video_transition_mode"] = params.video_transition_mode
+            config.ui["match_materials_to_script"] = params.match_materials_to_script
+            config.ui["voice_rate"] = params.voice_rate
+            config.ui["voice_volume"] = params.voice_volume
+            config.ui["bgm_type"] = params.bgm_type
+            config.ui["bgm_volume"] = params.bgm_volume
+            config.ui["paragraph_number"] = params.paragraph_number
+            config.ui["target_duration_minutes"] = params.target_duration_minutes
+            config.save_config()
+
+    with tab_clips_auto:
+        render_clips_automation_tab()
 
 
 _render_application()

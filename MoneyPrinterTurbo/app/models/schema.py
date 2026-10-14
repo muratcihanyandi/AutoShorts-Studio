@@ -114,6 +114,7 @@ class VideoParams(BaseModel):
     stroke_width: float = 1.5
     n_threads: Optional[int] = 2
     paragraph_number: int = Field(default=1, ge=1, le=10)
+    target_duration_minutes: float = Field(default=0.0, ge=0.0)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
 
@@ -453,7 +454,7 @@ class VideoMaterialRetrieveResponse(BaseResponse):
                         {
                             "name": "example.mp4",
                             "size": 12345678,
-                            "file": "/MoneyPrinterTurbo/resource/videos/example.mp4",
+                            "file": "/AutoShortsStudio/resource/videos/example.mp4",
                         }
                     ]
                 },
@@ -468,7 +469,7 @@ class VideoMaterialUploadResponse(BaseResponse):
                 "status": 200,
                 "message": "success",
                 "data": {
-                    "file": "/MoneyPrinterTurbo/resource/videos/example.mp4",
+                    "file": "/AutoShortsStudio/resource/videos/example.mp4",
                 },
             },
         }

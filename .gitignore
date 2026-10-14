@@ -15,3 +15,12 @@ MoneyPrinterTurbo/resource/youtube_token.json
 MoneyPrinterTurbo/__pycache__/
 MoneyPrinterTurbo/logs/
 MoneyPrinterTurbo/test_dir/
+config.toml
+MoneyPrinterTurbo/config.toml
+*.db
+*.sqlite
+*.sqlite3
+.env
+.tmp.driveupload/
+*.tmp
+*.log

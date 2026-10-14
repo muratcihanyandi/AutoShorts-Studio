@@ -218,7 +218,7 @@ def get_default_ollama_base_url() -> str:
 
 
 def load_config():
-    # fix: IsADirectoryError: [Errno 21] Is a directory: '/MoneyPrinterTurbo/config.toml'
+    # fix: IsADirectoryError: [Errno 21] Is a directory: 'config.toml'
     if os.path.isdir(config_file) and not os.path.islink(config_file):
         logger.warning(f"config path is a directory, removing: {config_file}")
         shutil.rmtree(config_file)
@@ -316,10 +316,10 @@ hostname = socket.gethostname()
 log_level = _cfg.get("log_level", "DEBUG")
 listen_host = _cfg.get("listen_host", "127.0.0.1")
 listen_port = _cfg.get("listen_port", 8080)
-project_name = _cfg.get("project_name", "MoneyPrinterTurbo")
+project_name = _cfg.get("project_name", "AutoShorts Studio")
 project_description = _cfg.get(
     "project_description",
-    "<a href='https://github.com/harry0703/MoneyPrinterTurbo'>https://github.com/harry0703/MoneyPrinterTurbo</a>",
+    "AutoShorts Studio - AI Video & Streamer Clips Generator",
 )
 project_version = _cfg.get("project_version", __version__)
 reload_debug = False

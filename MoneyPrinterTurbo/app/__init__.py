@@ -1,3 +1,3 @@
-"""MoneyPrinterTurbo 应用包元数据。"""
+"""AutoShorts Studio package metadata."""
 
-__version__ = "1.3.2"
+__version__ = "2.0.0"

@@ -206,7 +206,7 @@ def test_generation_submit_skips_duplicate_config_save():
 
     submitted_assignment = next(
         node
-        for node in application.body
+        for node in ast.walk(application)
         if isinstance(node, ast.Assign)
         and any(
             isinstance(target, ast.Name)
@@ -221,7 +221,7 @@ def test_generation_submit_skips_duplicate_config_save():
 
     guarded_save = next(
         node
-        for node in application.body
+        for node in ast.walk(application)
         if isinstance(node, ast.If)
         and ast.unparse(node.test) == "not generation_submitted"
     )

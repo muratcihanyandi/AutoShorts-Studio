@@ -1,5 +1,5 @@
 """
-YouTube OAuth Authentication Helper for MoneyPrinterTurbo
+YouTube OAuth Authentication Helper for AutoShorts Studio
 This script helps you authenticate your YouTube channel and saves your access token.
 """
 import os
@@ -13,7 +13,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Ensure MoneyPrinterTurbo is in sys.path
+# Ensure AutoShorts Studio is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.config import config
@@ -22,7 +22,7 @@ from app.services.youtube_uploader import youtube_uploader_service
 
 def main():
     print("=" * 60)
-    print("MoneyPrinterTurbo - YouTube Kanal Yetkilendirme Aracı")
+    print("AutoShorts Studio - YouTube Kanal Yetkilendirme Araci")
     print("=" * 60)
 
     client_secrets = youtube_uploader_service.client_secrets_file
