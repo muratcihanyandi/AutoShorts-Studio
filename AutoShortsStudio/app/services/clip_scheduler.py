@@ -203,22 +203,27 @@ class ClipSchedulerService:
 
                 if transcript_str.strip():
                     try:
-                        start_sec, end_sec, hook_text, yt_title, viral_score = hype_detector.detect_viral_moments_llm(
+                        detected = hype_detector.detect_viral_moments_llm(
                             transcript_with_timestamps=transcript_str,
                             total_duration=total_duration,
                             channel_name=clip.channel_name,
                             video_title=clip.title,
                             target_window_sec=settings.shorts_window_sec
                         )
-                        clip.hook_text = hook_text
-                        clip.viral_score = viral_score
-                        if yt_title:
-                            clip.youtube_title = yt_title
-                        clip.hype_score = round(viral_score / 10.0, 2)
-                        used_llm = True
-                        self._add_log(f"LLM viral an secildi: {start_sec:.1f}s - {end_sec:.1f}s (Hook: '{hook_text}', Score: {viral_score}/10)", "info")
+                        if detected is not None:
+                            start_sec, end_sec, hook_text, yt_title, viral_score = detected
+                            clip.hook_text = hook_text
+                            clip.viral_score = viral_score
+                            if yt_title:
+                                clip.youtube_title = yt_title
+                            clip.hype_score = round(viral_score / 10.0, 2)
+                            used_llm = True
+                            self._add_log(f"LLM viral an secildi: {start_sec:.1f}s - {end_sec:.1f}s (Hook: '{hook_text}', Score: {viral_score}/10)", "info")
+                        else:
+                            self._add_log("LLM erisilemedi veya kapali (Ollama/API hatasi). Ses tepe noktasi (hype) analizine geciliyor...", "warning")
                     except Exception as ex:
                         logger.warning(f"detect_viral_moments_llm failed: {ex}")
+                        self._add_log(f"LLM hatasi ({ex}). Ses tepe noktasi analizine geciliyor...", "warning")
 
             if not used_llm:
                 self._current_task_info = f"Hype analizi: {clip.title[:30]}"

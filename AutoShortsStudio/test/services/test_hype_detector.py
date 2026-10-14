@@ -67,6 +67,25 @@ class TestHypeDetector(unittest.TestCase):
         self.assertEqual(title, "Rraenee Güldüren An #shorts")
         self.assertEqual(score, 10)
 
+    @patch("app.services.llm.generate_viral_moment_selection")
+    def test_hype_detector_detect_viral_moments_llm_returns_none_on_fallback(self, mock_llm_select):
+        # When LLM is offline or fails, generate_viral_moment_selection returns is_fallback: True
+        mock_llm_select.return_value = {
+            "start_sec": 40.0,
+            "end_sec": 80.0,
+            "viral_hook_text": "Fallback",
+            "youtube_title": "Fallback #shorts",
+            "viral_score": 7,
+            "is_fallback": True
+        }
+        res = hype_detector.detect_viral_moments_llm(
+            transcript_with_timestamps="dummy transcript",
+            total_duration=120.0,
+            channel_name="Rraenee",
+            video_title="Test Video"
+        )
+        self.assertIsNone(res)
+
 
 if __name__ == "__main__":
     unittest.main()

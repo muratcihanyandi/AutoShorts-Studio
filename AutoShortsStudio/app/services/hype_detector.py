@@ -1,7 +1,7 @@
 import os
 import re
 import subprocess
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from loguru import logger
 
 from app.utils import utils
@@ -189,12 +189,12 @@ class HypeDetectorService:
         channel_name: str = "",
         video_title: str = "",
         target_window_sec: float = 40.0
-    ) -> Tuple[float, float, str, str, int]:
+    ) -> Optional[Tuple[float, float, str, str, int]]:
         """
         OpenShorts LLM viral moment tespiti.
         Transkripti analiz ederek en viral 25-55 saniyelik bolumu, kanca (hook) metnini,
         YouTube Shorts basligini ve viral puanini dondurur.
-        Dondurur: (start_sec, end_sec, hook_text, youtube_title, viral_score)
+        LLM baglantisi yoksa veya basarisizsa None dondurur (ses hype analizi devreye girer).
         """
         from app.services import llm
         try:
@@ -206,6 +206,10 @@ class HypeDetectorService:
                 min_window=max(20.0, target_window_sec - 15.0),
                 max_window=min(total_duration, target_window_sec + 15.0)
             )
+            if not res or res.get("is_fallback"):
+                logger.warning("LLM response was not valid or was fallback, returning None for audio peak fallback")
+                return None
+
             return (
                 res["start_sec"],
                 res["end_sec"],
@@ -214,11 +218,8 @@ class HypeDetectorService:
                 res["viral_score"]
             )
         except Exception as e:
-            logger.warning(f"detect_viral_moments_llm error: {e}, using heuristic fallback")
-            s = max(0.0, (total_duration - target_window_sec) / 2.0)
-            e_sec = min(total_duration, s + target_window_sec)
-            hook = f"{channel_name}: {video_title}" if channel_name else video_title
-            return round(s, 2), round(e_sec, 2), hook or "En İyi An 🔥", f"{hook or 'Klip'} #shorts", 7
+            logger.warning(f"detect_viral_moments_llm error: {e}")
+            return None
 
 
 hype_detector = HypeDetectorService()

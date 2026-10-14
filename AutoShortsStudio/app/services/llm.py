@@ -1014,7 +1014,8 @@ def _fallback_viral_moment(total_duration: float, video_title: str = "", channel
         "viral_hook_text": hook,
         "youtube_title": f"{hook} #shorts",
         "viral_score": 7,
-        "reason": "Heuristic fallback"
+        "reason": "Heuristic fallback",
+        "is_fallback": True
     }
 
 
