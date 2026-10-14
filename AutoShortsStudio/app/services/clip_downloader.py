@@ -681,6 +681,7 @@ class ClipDownloaderService:
 
         cmd = self._base_ytdlp_cmd() + [
             "--no-playlist",
+            "--newline",
             "-f", fmt,
             "--merge-output-format", "mp4",
             "--retries", "3",
@@ -693,17 +694,49 @@ class ClipDownloaderService:
         if clip.duration and clip.duration > 300:
             timeout = int(max(300, clip.duration * 20))
 
+        progress_re = re.compile(
+            r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*([\d\.]+\s*[kKmMgGtT]i?B)(?:\s+at\s+([\d\.]+\s*\S+))?(?:\s+ETA\s+(\S+))?"
+        )
+
         try:
-            res = subprocess.run(
+            from app.services.video_progress_tracker import video_progress_tracker
+
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
-                errors="replace",
-                timeout=timeout
+                errors="replace"
             )
-            if res.returncode != 0:
-                raise RuntimeError(f"yt-dlp failed (code {res.returncode}): {res.stderr}")
+
+            last_output_lines = []
+            for line in proc.stdout:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                last_output_lines.append(line_str)
+                if len(last_output_lines) > 20:
+                    last_output_lines.pop(0)
+
+                m = progress_re.search(line_str)
+                if m:
+                    pct = float(m.group(1))
+                    total_size = m.group(2) or ""
+                    speed = m.group(3) or ""
+                    eta = m.group(4) or ""
+                    video_progress_tracker.update_download_progress(
+                        percent=pct,
+                        speed=speed,
+                        eta=eta,
+                        detail=f"İndiriliyor: %{pct:.1f} / {total_size} ({speed}) - Kalan: {eta}"
+                    )
+
+            proc.wait(timeout=timeout)
+
+            if proc.returncode != 0:
+                err_summary = "\n".join(last_output_lines[-5:])
+                raise RuntimeError(f"yt-dlp failed (code {proc.returncode}): {err_summary}")
 
             if not os.path.exists(out_path):
                 # Eger yt-dlp uzanti degistirdiyse kontrol et
@@ -721,6 +754,12 @@ class ClipDownloaderService:
             clip.status = ClipStatus.DOWNLOADED
             clip_db.update_clip_status(clip.clip_id, ClipStatus.DOWNLOADED, raw_video_path=out_path)
             logger.info(f"Clip successfully downloaded: {out_path} ({os.path.getsize(out_path)} bytes)")
+            video_progress_tracker.update_stage(
+                stage="downloaded",
+                stage_label="İndirme Tamamlandı",
+                percent=35.0,
+                detail=f"İndirme tamamlandı: {os.path.basename(out_path)}"
+            )
             return out_path
 
         except Exception as e:

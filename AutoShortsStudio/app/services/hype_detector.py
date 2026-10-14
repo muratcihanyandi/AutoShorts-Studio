@@ -221,6 +221,29 @@ class HypeDetectorService:
             logger.warning(f"detect_viral_moments_llm error: {e}")
             return None
 
+    def extract_thumbnail_frame(self, video_path: str, timestamp_sec: float, out_image_path: str) -> bool:
+        """
+        Videodaki belirli bir saniyeden yuksek kaliteli JPEG kapak gorseli (thumbnail) cikarir.
+        """
+        if not os.path.exists(video_path):
+            return False
+        os.makedirs(os.path.dirname(out_image_path), exist_ok=True)
+        safe_time = max(0.0, float(timestamp_sec))
+        cmd = [
+            self.ffmpeg_bin, "-y",
+            "-ss", str(safe_time),
+            "-i", video_path,
+            "-frames:v", "1",
+            "-q:v", "2",
+            out_image_path
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            return res.returncode == 0 and os.path.exists(out_image_path) and os.path.getsize(out_image_path) > 1024
+        except Exception as e:
+            logger.warning(f"Thumbnail extraction failed at {safe_time}s: {e}")
+            return False
+
 
 hype_detector = HypeDetectorService()
 

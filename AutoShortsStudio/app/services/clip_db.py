@@ -19,7 +19,8 @@ _CLIPS_UPDATE_COLUMNS = {
     "hype_score", "viral_score", "hook_text", "cut_start_sec", "cut_end_sec", "priority",
     "youtube_title", "youtube_description", "youtube_tags", "youtube_video_id",
     "youtube_status", "published_at", "target_format", "source_kind", "source_key",
-    "error_message",
+    "error_message", "scheduled_publish_time", "custom_thumbnail_path",
+    "youtube_category_id", "made_for_kids", "age_restricted",
 }
 
 
@@ -125,6 +126,11 @@ class ClipDatabase:
             "published_at": "ALTER TABLE clips ADD COLUMN published_at TEXT",
             "hook_text": "ALTER TABLE clips ADD COLUMN hook_text TEXT",
             "viral_score": "ALTER TABLE clips ADD COLUMN viral_score INTEGER DEFAULT 0",
+            "scheduled_publish_time": "ALTER TABLE clips ADD COLUMN scheduled_publish_time TEXT",
+            "custom_thumbnail_path": "ALTER TABLE clips ADD COLUMN custom_thumbnail_path TEXT",
+            "youtube_category_id": "ALTER TABLE clips ADD COLUMN youtube_category_id TEXT",
+            "made_for_kids": "ALTER TABLE clips ADD COLUMN made_for_kids INTEGER DEFAULT 0",
+            "age_restricted": "ALTER TABLE clips ADD COLUMN age_restricted INTEGER DEFAULT 0",
         }
         for col, sql in clips_migration.items():
             if col not in clips_cols:
@@ -260,6 +266,7 @@ class ClipDatabase:
             now_str = datetime.utcnow().isoformat()
             tags_json = json.dumps(clip.youtube_tags or [])
             published_at_str = clip.published_at.isoformat() if clip.published_at else None
+            sched_str = clip.scheduled_publish_time.isoformat() if clip.scheduled_publish_time else None
             cursor.execute("""
                 INSERT OR REPLACE INTO clips (
                     clip_id, platform, channel_name, title, url, duration, view_count,
@@ -267,8 +274,9 @@ class ClipDatabase:
                     status, raw_video_path, processed_video_path, subtitle_path, transcript,
                     hype_score, viral_score, hook_text, cut_start_sec, cut_end_sec, priority,
                     youtube_title, youtube_description, youtube_tags, youtube_video_id,
-                    youtube_status, published_at, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    youtube_status, youtube_category_id, made_for_kids, age_restricted,
+                    custom_thumbnail_path, scheduled_publish_time, published_at, error_message, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 clip.clip_id,
                 clip.platform.value,
@@ -298,6 +306,11 @@ class ClipDatabase:
                 tags_json,
                 clip.youtube_video_id,
                 clip.youtube_status,
+                clip.youtube_category_id,
+                1 if clip.made_for_kids else 0,
+                1 if clip.age_restricted else 0,
+                clip.custom_thumbnail_path,
+                sched_str,
                 published_at_str,
                 clip.error_message,
                 clip.created_at.isoformat() if clip.created_at else now_str,
@@ -395,17 +408,88 @@ class ClipDatabase:
             return self._row_to_clip(r) if r else None
 
     def next_ready_clip(self, target_format: str) -> Optional[ClipItem]:
-        """Yayinlanmayi bekleyen en uygun READY klip (oncelik > hype > eskilik)."""
+        """Yayinlanmayi bekleyen en uygun READY klip (oncelik > viral_score > hype > eskilik)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT * FROM clips
                 WHERE status = ? AND target_format = ?
-                ORDER BY priority DESC, hype_score DESC, id ASC
+                ORDER BY priority DESC, viral_score DESC, hype_score DESC, id ASC
                 LIMIT 1
             """, (ClipStatus.READY.value, target_format))
             r = cursor.fetchone()
             return self._row_to_clip(r) if r else None
+
+    def list_ready_clips(self, target_format: Optional[str] = None, limit: int = 50) -> List[ClipItem]:
+        """READY durumundaki tum videolari oncelik ve viralite sirasiyla getirir."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if target_format:
+                cursor.execute("""
+                    SELECT * FROM clips WHERE status = ? AND target_format = ?
+                    ORDER BY priority DESC, viral_score DESC, hype_score DESC, id ASC LIMIT ?
+                """, (ClipStatus.READY.value, target_format, limit))
+            else:
+                cursor.execute("""
+                    SELECT * FROM clips WHERE status = ?
+                    ORDER BY priority DESC, viral_score DESC, hype_score DESC, id ASC LIMIT ?
+                """, (ClipStatus.READY.value, limit))
+            return [self._row_to_clip(r) for r in cursor.fetchall()]
+
+    def list_downloaded_clips(self, target_format: Optional[str] = None, limit: int = 50) -> List[ClipItem]:
+        """Diskte indirilmis (DOWNLOADED) olan ham videolari listeler."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if target_format:
+                cursor.execute("""
+                    SELECT * FROM clips WHERE status = ? AND target_format = ?
+                    ORDER BY id DESC LIMIT ?
+                """, (ClipStatus.DOWNLOADED.value, target_format, limit))
+            else:
+                cursor.execute("""
+                    SELECT * FROM clips WHERE status = ?
+                    ORDER BY id DESC LIMIT ?
+                """, (ClipStatus.DOWNLOADED.value, limit))
+            return [self._row_to_clip(r) for r in cursor.fetchall()]
+
+    def list_clips_by_status(self, status: ClipStatus, target_format: Optional[str] = None, limit: int = 50) -> List[ClipItem]:
+        """Belirtilen durumdaki (orn. PUBLISHED, DISCOVERED) tum videolari getirir."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            status_val = status.value if isinstance(status, ClipStatus) else str(status)
+            if target_format:
+                cursor.execute("""
+                    SELECT * FROM clips WHERE status = ? AND target_format = ?
+                    ORDER BY id DESC LIMIT ?
+                """, (status_val, target_format, limit))
+            else:
+                cursor.execute("""
+                    SELECT * FROM clips WHERE status = ?
+                    ORDER BY id DESC LIMIT ?
+                """, (status_val, limit))
+            return [self._row_to_clip(r) for r in cursor.fetchall()]
+
+    def update_clip_metadata(self, clip_id: str, **kwargs):
+        """WebUI veya servislerden bir klibin meta verilerini (baslik, etiket, kategori, thumbnail vb.) gunceller."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            now_str = datetime.utcnow().isoformat()
+            updates = ["updated_at = ?"]
+            params = [now_str]
+            for k, v in kwargs.items():
+                if k not in _CLIPS_UPDATE_COLUMNS:
+                    raise ValueError(f"Invalid clip update column: {k}")
+                if k == "youtube_tags" and isinstance(v, list):
+                    v = json.dumps(v)
+                elif k == "scheduled_publish_time" and isinstance(v, datetime):
+                    v = v.isoformat()
+                elif k in ("made_for_kids", "age_restricted") and isinstance(v, bool):
+                    v = 1 if v else 0
+                updates.append(f"{k} = ?")
+                params.append(v)
+            params.append(clip_id)
+            cursor.execute(f"UPDATE clips SET {', '.join(updates)} WHERE clip_id = ?", params)
+            conn.commit()
 
     def delete_clip(self, clip_id: str) -> bool:
         clip = self.get_clip_by_id(clip_id)
@@ -495,6 +579,11 @@ class ClipDatabase:
             youtube_tags=tags,
             youtube_video_id=r["youtube_video_id"],
             youtube_status=r["youtube_status"],
+            youtube_category_id=r["youtube_category_id"] if "youtube_category_id" in r.keys() else None,
+            made_for_kids=bool(r["made_for_kids"]) if "made_for_kids" in r.keys() and r["made_for_kids"] is not None else False,
+            age_restricted=bool(r["age_restricted"]) if "age_restricted" in r.keys() and r["age_restricted"] is not None else False,
+            custom_thumbnail_path=r["custom_thumbnail_path"] if "custom_thumbnail_path" in r.keys() else None,
+            scheduled_publish_time=datetime.fromisoformat(r["scheduled_publish_time"]) if "scheduled_publish_time" in r.keys() and r["scheduled_publish_time"] else None,
             published_at=datetime.fromisoformat(r["published_at"]) if r["published_at"] else None,
             error_message=r["error_message"],
             created_at=datetime.fromisoformat(r["created_at"]) if r["created_at"] else None,

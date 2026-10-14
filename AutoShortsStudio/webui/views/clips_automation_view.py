@@ -1,5 +1,6 @@
 import os
 import threading
+from datetime import datetime
 import streamlit as st
 from loguru import logger
 
@@ -12,6 +13,7 @@ from app.services.clip_scheduler import clip_scheduler
 from app.services.shorts_publisher import shorts_publisher
 from app.services.clip_publisher import clip_publisher
 from app.services.clip_downloader import clip_downloader
+from app.services.video_progress_tracker import video_progress_tracker
 
 PLATFORM_LABELS = {
     PlatformType.TWITCH: "🟣 Twitch",
@@ -24,9 +26,33 @@ FORMAT_LABELS = {
     ClipTargetFormat.HORIZONTAL: "🖥️ Yatay Video",
 }
 
+STATUS_LABELS = {
+    ClipStatus.DISCOVERED: "🕐 Sırada (Keşfedildi)",
+    ClipStatus.DOWNLOADING: "⬇️ İndiriliyor",
+    ClipStatus.DOWNLOADED: "📥 İndirildi (Ham)",
+    ClipStatus.ANALYZING: "🔍 Analiz Ediliyor",
+    ClipStatus.EDITING: "✂️ Kurgulanıyor",
+    ClipStatus.READY: "✅ Hazır (Stokta)",
+    ClipStatus.UPLOADING: "📤 YouTube'a Yükleniyor",
+    ClipStatus.PUBLISHED: "🎉 Yayında",
+    ClipStatus.SPLIT: "🧩 Parçalara Bölündü",
+    ClipStatus.FAILED: "❌ Hata Aldı",
+    ClipStatus.SKIPPED: "⏭️ Atlandı",
+}
+
+YOUTUBE_CATEGORIES = {
+    "20": "🎮 Oyun (Gaming)",
+    "22": "👤 İnsanlar ve Bloglar (People & Blogs)",
+    "24": "🎭 Eğlence (Entertainment)",
+    "23": "😂 Komedi (Comedy)",
+    "17": "⚽ Spor (Sports)",
+    "1": "🎬 Film ve Animasyon (Film & Animation)",
+    "28": "🔬 Bilim ve Teknoloji (Science & Technology)",
+}
+
 
 def _start_background(fn, *args, **kwargs):
-    """Uzun suren islemleri (indirme/kurgu/yukleme) UI'yi dondurmadan baslatir."""
+    """Uzun süren işlemleri UI'yi dondurmadan arka planda başlatır."""
     thread = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
     thread.start()
     return thread
@@ -52,157 +78,304 @@ def _publish_clip_bg(clip_id: str):
         logger.error(f"Manual publish failed for {clip_id}: {e}")
 
 
-@st.fragment(run_every="5s")
-def _render_log_panel():
-    """Canli sistem loglari (otomatik yenilenir)."""
-    st.subheader("📜 Canlı Sistem ve Motor Logları")
-    logs = clip_scheduler.get_recent_logs(limit=18)
-    log_box = ""
-    for l in logs:
-        color = "#4CAF50" if l["level"] == "info" else ("#FF9800" if l["level"] == "warning" else "#F44336")
-        log_box += (
-            f"<div style='font-family: monospace; font-size: 13px; margin-bottom: 4px;'>"
-            f"<span style='color: #888;'>[{l['timestamp']}]</span> "
-            f"<span style='color: {color}; font-weight: bold;'>[{l['level'].upper()}]</span> "
-            f"{l['message']}</div>"
+# ================= CANLI İLERLEME & MOTOR LOGLARI =================
+
+@st.fragment(run_every="2s")
+def _render_live_pipeline_panel():
+    """Video başına detaylı indirme/kurgu ilerlemesi ve canlı durum paneli."""
+    task = video_progress_tracker.get_active_task()
+
+    if task:
+        # Aktif işlenen video kartı
+        progress_val = min(1.0, max(0.0, float(task.get("progress_percent", 0.0)) / 100.0))
+        pct_display = f"{task.get('progress_percent', 0.0):.1f}%"
+        stage_label = task.get("stage_label", "İşleniyor")
+        title = task.get("title", "Video")
+        channel = task.get("channel_name", "")
+        fmt = "📱 Shorts" if task.get("target_format") == "shorts" else "🖥️ Yatay"
+        speed = task.get("speed_str") or "--"
+        eta = task.get("eta_str") or "--"
+        elapsed = task.get("elapsed_str") or "00:00"
+        detail = task.get("detail_message", "")
+
+        st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #161824 0%, #1e2238 100%); border: 1px solid #3d466e; border-left: 6px solid #00E676; border-radius: 10px; padding: 16px; margin-bottom: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.3);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="display: inline-block; width: 10px; height: 10px; background-color: #00E676; border-radius: 50%; box-shadow: 0 0 8px #00E676;"></span>
+                        <span style="font-weight: bold; color: #FFFFFF; font-size: 15px; letter-spacing: 0.5px;">CANLI İŞLENEN VİDEO</span>
+                        <span style="background: #2a3152; color: #9fa8da; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">{fmt}</span>
+                    </div>
+                    <span style="font-weight: 800; font-size: 18px; color: #00E676; font-family: monospace;">{pct_display}</span>
+                </div>
+                <div style="font-size: 16px; font-weight: 600; color: #FFFFFF; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                    {title}
+                </div>
+                <div style="font-size: 13px; color: #9fa8da; margin-bottom: 12px;">
+                    Yayıncı: <strong style="color: #e0e0e0;">{channel}</strong> · Aşama: <strong style="color: #80d8ff;">{stage_label}</strong>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        st.progress(progress_val)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("İşlem Aşaması", stage_label)
+        with c2:
+            st.metric("İndirme / İşleme Hızı", speed)
+        with c3:
+            st.metric("Tahmini Kalan (ETA)", eta)
+        with c4:
+            st.metric("Geçen Süre", elapsed)
+
+        if detail:
+            st.caption(f"ℹ️ **Detay:** {detail}")
+
+    else:
+        # Motor beklemede (Idle)
+        settings = clip_db.get_settings()
+        ready_h = clip_db.count_clips(status="ready", target_format="horizontal")
+        ready_s = clip_db.count_clips(status="ready", target_format="shorts")
+        target_h = settings.target_stock_horizontal
+        target_s = settings.target_stock_shorts
+
+        status_msg = (
+            f"🟢 **Motor Çalışıyor (Boşta):** Stok hedefleri takip ediliyor. "
+            f"(Yatay: {ready_h}/{target_h} hazır · Shorts: {ready_s}/{target_s} hazır)"
+            if clip_scheduler.is_running else
+            f"⏸️ **Motor Durduruldu:** Yeni videoları 1'er 1'er indirip stokları doldurmak için motoru başlatın."
         )
-    if not log_box:
-        log_box = ("<div style='color: #888; font-family: monospace; font-size: 13px;'>"
-                   "Henüz log kaydı yok. Motor başlatıldığında burada listelenecek.</div>")
 
-    st.markdown(f"""
-        <div style="background-color: #121218; border: 1px solid #333344; border-radius: 8px; padding: 12px; height: 200px; overflow-y: auto;">
-            {log_box}
-        </div>
-    """, unsafe_allow_html=True)
+        st.markdown(f"""
+            <div style="background: #14161f; border: 1px solid #282c3f; border-left: 5px solid #5c6bc0; border-radius: 8px; padding: 14px 18px; margin-bottom: 12px;">
+                <div style="color: #c5cae9; font-size: 14px;">
+                    {status_msg}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    # Canlı Motor Logları (Altında kompakt akış)
+    with st.expander("📜 Canlı Motor ve Keşif Logları", expanded=False):
+        logs = clip_scheduler.get_recent_logs(limit=25)
+        log_box = ""
+        for l in logs:
+            color = "#00E676" if l["level"] == "info" else ("#FFB74D" if l["level"] == "warning" else "#FF5252")
+            log_box += (
+                f"<div style='font-family: monospace; font-size: 12px; margin-bottom: 3px; line-height: 1.4;'>"
+                f"<span style='color: #7986cb;'>[{l['timestamp']}]</span> "
+                f"<span style='color: {color}; font-weight: bold;'>[{l['level'].upper()}]</span> "
+                f"<span style='color: #e0e0e0;'>{l['message']}</span></div>"
+            )
+        if not log_box:
+            log_box = "<div style='color: #888; font-family: monospace; font-size: 12px;'>Henüz log kaydı yok.</div>"
+
+        st.markdown(f"""
+            <div style="background-color: #0d0e15; border: 1px solid #222538; border-radius: 6px; padding: 10px; max-height: 180px; overflow-y: auto;">
+                {log_box}
+            </div>
+        """, unsafe_allow_html=True)
 
 
-def _render_stock_tab(target_format: ClipTargetFormat, settings: ClipPipelineSettings):
-    """Stok sekmesi: bekleyen/hazır videolar ve eylem butonlari."""
-    fmt_value = target_format.value
-    clips = clip_db.list_clips(limit=25, target_format=fmt_value)
-    quota = clip_publisher.get_quota_summary(settings)[fmt_value]
+# ================= MEDYA HAVUZU & STOK KARTLARI =================
 
-    st.markdown(
-        f"**Bugün yüklenen:** {quota['published_today']} / {quota['daily_limit']} "
-        f"| **Stok:** {quota['ready_in_stock']} hazır, {quota['discovered_in_stock']} bekliyor"
-    )
+def _render_video_card(clip: ClipItem, settings: ClipPipelineSettings, is_stock: bool = True):
+    """Her video için video oynatıcılı, yayın saatli ve YouTube ayarlı modern kart."""
+    with st.container(border=True):
+        col_main, col_side = st.columns([2.5, 1.5])
 
-    if not clips:
-        st.info("Bu formatta henüz video yok. Yayıncı ekleyip motoru başlatın.")
-        return
+        with col_main:
+            # Planlanan yayın zamanı rozeti (Varsa)
+            sched_badge = ""
+            if clip.scheduled_publish_time:
+                sched_dt = clip.scheduled_publish_time
+                now = datetime.now()
+                if sched_dt.date() == now.date():
+                    sched_text = f"Bugün {sched_dt.strftime('%H:%M')} (Prime Time)"
+                elif sched_dt.date() == (now.date() + timedelta(days=1)):
+                    sched_text = f"Yarın {sched_dt.strftime('%H:%M')} (Prime Time)"
+                else:
+                    sched_text = f"{sched_dt.strftime('%d.%m %H:%M')} (Prime Time)"
+                sched_badge = f"<span style='background: linear-gradient(90deg, #7b1fa2, #e91e63); color: #fff; padding: 3px 9px; border-radius: 12px; font-size: 12px; font-weight: 600; margin-right: 8px;'>⏰ Otomasyon Yayını: {sched_text}</span>"
 
-    status_labels = {
-        ClipStatus.DISCOVERED: "🕐 Bekliyor",
-        ClipStatus.DOWNLOADING: "⬇️ İndiriliyor",
-        ClipStatus.DOWNLOADED: "📥 İndirildi",
-        ClipStatus.ANALYZING: "🔍 Analiz",
-        ClipStatus.EDITING: "✂️ Kurgulanıyor",
-        ClipStatus.READY: "✅ Hazır",
-        ClipStatus.UPLOADING: "📤 Yükleniyor",
-        ClipStatus.PUBLISHED: "🎉 Yayında",
-        ClipStatus.SPLIT: "🧩 Parçalandı",
-        ClipStatus.FAILED: "❌ Hata",
-        ClipStatus.SKIPPED: "⏭️ Atladı",
-    }
+            # Format ve Durum rozetleri
+            fmt_icon = "📱 Shorts" if clip.target_format == ClipTargetFormat.SHORTS else "🖥️ Yatay"
+            status_txt = STATUS_LABELS.get(clip.status, clip.status.value)
+            st.markdown(f"{sched_badge}<span style='background: #25283d; color: #b0bec5; padding: 2px 8px; border-radius: 4px; font-size: 12px;'>{fmt_icon}</span> <span style='background: #1e3a2b; color: #81c784; padding: 2px 8px; border-radius: 4px; font-size: 12px;'>{status_txt}</span>", unsafe_allow_html=True)
 
-    for clip in clips:
-        with st.container(border=True):
-            col_info, col_actions = st.columns([2.4, 1.6])
+            yt_link = f" · [YouTube'da Aç](https://youtu.be/{clip.youtube_video_id})" if clip.youtube_video_id else ""
+            st.markdown(f"### {clip.title[:80]}{yt_link}")
 
-            with col_info:
-                yt_link = f" · [İzle](https://youtu.be/{clip.youtube_video_id})" if clip.youtube_video_id else ""
-                hook_badge = f"  \n🎣 **Kanca:** *{clip.hook_text}*" if clip.hook_text else ""
-                viral_badge = f" · viral: {clip.viral_score}/10" if clip.viral_score else ""
-                st.markdown(
-                    f"**{clip.title[:70]}**{yt_link}  \n"
-                    f"`{status_labels.get(clip.status, clip.status.value)}` · "
-                    f"{clip.channel_name} · {clip.duration:.0f}sn · "
-                    f"izlenme: {clip.view_count} · hype: {clip.hype_score}{viral_badge} · öncelik: {clip.priority}"
-                    f"{hook_badge}"
-                )
-                if clip.error_message:
-                    st.caption(f"⚠️ {clip.error_message[:140]}")
+            meta_info = (
+                f"👤 **{clip.channel_name}** ({clip.platform.value}) · "
+                f"⏱️ {clip.duration:.0f}sn · "
+                f"👁️ {clip.view_count:,} izlenme"
+            )
+            if clip.viral_score:
+                meta_info += f" · 🔥 **Viral: {clip.viral_score}/10**"
+            if clip.priority:
+                meta_info += f" · ⬆️ Öncelik: {clip.priority}"
 
-            with col_actions:
-                btn_a, btn_b, btn_c = st.columns(3)
-                with btn_a:
-                    if clip.status in (ClipStatus.DISCOVERED, ClipStatus.FAILED, ClipStatus.SKIPPED):
-                        if st.button("⚙️ İşle", key=f"proc_{clip.clip_id}", use_container_width=True):
-                            _start_background(_process_clip_bg, clip.clip_id)
-                            st.toast(f"İşleme alındı: {clip.title[:30]}")
-                with btn_b:
-                    if clip.status == ClipStatus.READY:
-                        if st.button("📤 Yükle", key=f"pub_{clip.clip_id}", use_container_width=True):
-                            _start_background(_publish_clip_bg, clip.clip_id)
-                            st.toast(f"Yükleniyor: {clip.title[:30]}")
-                with btn_c:
-                    if st.button("🗑️", key=f"del_{clip.clip_id}", use_container_width=True, help="Stoktan sil"):
-                        clip_db.delete_clip(clip.clip_id)
+            st.markdown(meta_info)
+
+            if clip.hook_text:
+                st.info(f"🎣 **Kanca (Hook Başlık):** *{clip.hook_text}*")
+
+            if clip.error_message:
+                st.error(f"⚠️ {clip.error_message}")
+
+        with col_side:
+            # Aksiyon Butonları
+            if clip.status == ClipStatus.READY:
+                if st.button("🚀 YouTube'a Şimdi Yükle", key=f"pub_btn_{clip.clip_id}", use_container_width=True, type="primary"):
+                    _start_background(_publish_clip_bg, clip.clip_id)
+                    st.toast(f"YouTube'a yükleme başlatıldı: {clip.title[:30]}")
+                    st.rerun()
+
+            elif clip.status in (ClipStatus.DOWNLOADED, ClipStatus.DISCOVERED, ClipStatus.FAILED):
+                if st.button("⚙️ Hemen Kurgula", key=f"proc_btn_{clip.clip_id}", use_container_width=True):
+                    _start_background(_process_clip_bg, clip.clip_id)
+                    st.toast(f"İşleme alındı: {clip.title[:30]}")
+                    st.rerun()
+
+            c_p1, c_p2, c_del = st.columns([1, 1, 1])
+            with c_p1:
+                if st.button("⬆️", key=f"p_up_{clip.clip_id}", help="Önceliği artır (Önce yayınlansın)", use_container_width=True):
+                    clip_db.update_clip_metadata(clip.clip_id, priority=clip.priority + 10)
+                    clip_publisher.update_scheduled_times_in_db(settings)
+                    st.rerun()
+            with c_p2:
+                if st.button("⬇️", key=f"p_dn_{clip.clip_id}", help="Önceliği düşür", use_container_width=True):
+                    clip_db.update_clip_metadata(clip.clip_id, priority=max(0, clip.priority - 10))
+                    clip_publisher.update_scheduled_times_in_db(settings)
+                    st.rerun()
+            with c_del:
+                if st.button("🗑️", key=f"del_btn_{clip.clip_id}", help="Stoktan ve diskten sil", use_container_width=True):
+                    clip_db.delete_clip(clip.clip_id)
+                    st.toast(f"Silindi: {clip.title[:25]}")
+                    st.rerun()
+
+        # Video Oynatıcı & Thumbnail Önizleme
+        video_file = clip.processed_video_path or clip.raw_video_path
+        has_video = video_file and os.path.exists(video_file)
+
+        col_pv, col_edit = st.columns([1.8, 2.2])
+
+        with col_pv:
+            if has_video:
+                with st.expander("🎬 Videoyu Siteden İzle", expanded=False):
+                    st.video(video_file)
+            elif clip.thumbnail_url:
+                st.image(clip.thumbnail_url, use_container_width=True)
+
+        with col_edit:
+            with st.expander("✏️ YouTube Yayın Ayarlarını & Filtrelerini Düzenle", expanded=False):
+                with st.form(f"edit_meta_{clip.clip_id}"):
+                    new_title = st.text_input("YouTube Başlığı", value=clip.youtube_title or clip.title)
+                    new_desc = st.text_area("Açıklama", value=clip.youtube_description or "", height=80)
+                    tags_str = ", ".join(clip.youtube_tags or [])
+                    new_tags_input = st.text_input("Etiketler (Virgülle ayırın)", value=tags_str)
+
+                    cat_keys = list(YOUTUBE_CATEGORIES.keys())
+                    current_cat = clip.youtube_category_id or settings.youtube_category_id or "20"
+                    cat_idx = cat_keys.index(current_cat) if current_cat in cat_keys else 0
+                    new_cat = st.selectbox(
+                        "YouTube Kategorisi",
+                        options=cat_keys,
+                        format_func=lambda k: YOUTUBE_CATEGORIES.get(k, k),
+                        index=cat_idx
+                    )
+
+                    c_k1, c_k2 = st.columns(2)
+                    with c_k1:
+                        new_kids = st.checkbox("Çocuklara Özel", value=clip.made_for_kids)
+                    with c_k2:
+                        new_age = st.checkbox("18+ Yaş Sınırı", value=clip.age_restricted)
+
+                    thumb_input = st.text_input("Özel Kapak Görseli (Thumbnail Dosya Yolu)", value=clip.custom_thumbnail_path or "")
+
+                    save_meta = st.form_submit_button("Kaydet ve Güncelle", use_container_width=True)
+                    if save_meta:
+                        parsed_tags = [t.strip().lstrip("#") for t in new_tags_input.split(",") if t.strip()]
+                        clip_db.update_clip_metadata(
+                            clip.clip_id,
+                            youtube_title=new_title.strip(),
+                            youtube_description=new_desc.strip(),
+                            youtube_tags=parsed_tags,
+                            youtube_category_id=new_cat,
+                            made_for_kids=new_kids,
+                            age_restricted=new_age,
+                            custom_thumbnail_path=thumb_input.strip() or None
+                        )
+                        st.success("YouTube yayın filtreleri güncellendi!")
                         st.rerun()
 
-                prio_a, prio_b = st.columns(2)
-                with prio_a:
-                    if st.button("⬆️ Öncelik", key=f"prio_up_{clip.clip_id}", use_container_width=True):
-                        clip_db.update_clip_status(clip.clip_id, clip.status, priority=clip.priority + 10)
-                        st.rerun()
-                with prio_b:
-                    if st.button("⬇️ Öncelik", key=f"prio_down_{clip.clip_id}", use_container_width=True):
-                        clip_db.update_clip_status(clip.clip_id, clip.status, priority=clip.priority - 10)
-                        st.rerun()
 
-            video_path = clip.processed_video_path or clip.raw_video_path
-            if video_path and os.path.exists(video_path):
-                with st.expander("🎬 Önizleme", expanded=False):
-                    st.video(video_path)
-
+# ================= ANA SEKMELER & SAYFA GÖRÜNÜMÜ =================
 
 def render_clips_automation_tab():
+    settings = clip_db.get_settings()
+    # Stok yayın zamanlamasını canlı güncelle
+    try:
+        clip_publisher.update_scheduled_times_in_db(settings)
+    except Exception:
+        pass
+
+    quota = clip_publisher.get_quota_summary(settings)
+
+    # Başlık & Banner
     st.markdown("""
-        <div style="background: linear-gradient(135deg, #1e1e2f 0%, #2a2b40 100%); padding: 18px 24px; border-radius: 12px; margin-bottom: 20px; border-left: 5px solid #9146FF;">
-            <h2 style="margin: 0; color: #FFFFFF; font-size: 24px; display: flex; align-items: center; gap: 10px;">
-                <span>⚡</span> Yayıncı Klip & Shorts Otomasyon Merkezi
-            </h2>
-            <p style="margin: 6px 0 0 0; color: #BBBBCC; font-size: 14px;">
-                Twitch / Kick / YouTube kaynaklarını otomatik tarar: kliplerden altyazılı dikey Shorts,
-                yayın geçmişi ve paylaşılmış videolardan intro/outro kırpılmış yatay videolar üretir.
-                Stoktaki videoları günlük kotaya göre YouTube'a yükler.
-            </p>
+        <div style="background: linear-gradient(135deg, #181a29 0%, #252844 100%); padding: 20px 24px; border-radius: 12px; margin-bottom: 20px; border-left: 6px solid #7C4DFF; box-shadow: 0 4px 18px rgba(0,0,0,0.25);">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h2 style="margin: 0; color: #FFFFFF; font-size: 25px; display: flex; align-items: center; gap: 10px;">
+                        <span>⚡</span> AutoShorts Studio — Klip & Shorts Otomasyon Merkezi
+                    </h2>
+                    <p style="margin: 6px 0 0 0; color: #B0BEC5; font-size: 14px;">
+                        YouTube ve Twitch yayıncılarını otonom tarar. Videoları <strong>sırayla (1'er 1'er)</strong> indirir ve kurgular.
+                        <strong>3 Yatay ve 6 Shorts</strong> stok tutar; videoları Prime Time saatlerinde otomatik yayınlar.
+                    </p>
+                </div>
+            </div>
         </div>
     """, unsafe_allow_html=True)
 
-    settings = clip_db.get_settings()
-    quota = clip_publisher.get_quota_summary(settings)
+    # 1. Metrik Barları
+    c_m1, c_m2, c_m3, c_m4, c_m5 = st.columns(5)
 
-    # 1. Bilgi & Durum Barlari
-    col_stat1, col_stat2, col_stat3, col_stat4, col_stat5 = st.columns(5)
+    with c_m1:
+        st_label = "🟢 ÇALIŞIYOR" if clip_scheduler.is_running else "⏸️ DURDURULDU"
+        st.metric("Otonom Motor", st_label, help="1'er 1'er indirme, kurgu ve prime time kotasını yönetir")
 
-    with col_stat1:
-        status_label = "🟢 ÇALIŞIYOR" if clip_scheduler.is_running else "⏸️ DURDURULDU"
-        st.metric("Otonom Motor", status_label, help="Keşif + stok işleme + kotalı yayınlama döngüsü")
+    with c_m2:
+        streamers = clip_db.list_streamers(active_only=True)
+        st.metric("Aktif Kanallar", f"{len(streamers)} Kanal", help="Takip edilen YouTube / Twitch / Kick kaynakları")
 
-    with col_stat2:
-        streamers = clip_db.list_streamers()
-        st.metric("Takip Edilen", f"{len(streamers)} Kanal", help="Twitch / Kick / YouTube takip hedefleri")
+    with c_m3:
+        sq = quota[ClipTargetFormat.SHORTS.value]
+        st.metric(
+            "Shorts Durumu",
+            f"{sq['ready_in_stock']} / {sq['target_stock']} Stok",
+            delta=f"Bugün: {sq['published_today']}/{sq['daily_limit']} Yüklendi"
+        )
 
-    with col_stat3:
-        shorts_q = quota[ClipTargetFormat.SHORTS.value]
-        st.metric("Bugün Shorts", f"{shorts_q['published_today']}/{shorts_q['daily_limit']}",
-                  help=f"Stokta {shorts_q['ready_in_stock']} hazır video bekliyor")
+    with c_m4:
+        hq = quota[ClipTargetFormat.HORIZONTAL.value]
+        st.metric(
+            "Yatay Video",
+            f"{hq['ready_in_stock']} / {hq['target_stock']} Stok",
+            delta=f"Bugün: {hq['published_today']}/{hq['daily_limit']} Yüklendi"
+        )
 
-    with col_stat4:
-        horiz_q = quota[ClipTargetFormat.HORIZONTAL.value]
-        st.metric("Bugün Yatay", f"{horiz_q['published_today']}/{horiz_q['daily_limit']}",
-                  help=f"Stokta {horiz_q['ready_in_stock']} hazır video bekliyor")
+    with c_m5:
+        is_yt = shorts_publisher.is_youtube_ready()
+        yt_badge = "✅ BAĞLI" if is_yt else "⚠️ TOKEN GEREKLİ"
+        st.metric("YouTube Durumu", yt_badge, help="YouTube OAuth kimlik doğrulaması")
 
-    with col_stat5:
-        yt_label = "✅ BAĞLI" if shorts_publisher.is_youtube_ready() else "⚠️ TOKEN GEREKLİ"
-        st.metric("YouTube", yt_label, help="YouTube Data API bağlantı ve token durumu")
+    st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px solid #282c3f;'>", unsafe_allow_html=True)
 
-    st.markdown("---")
-
-    # 2. Motor Kontrolu
-    col_ctrl, col_mode_info = st.columns([1.5, 2.5])
+    # 2. Canlı İlerleme ve Motor Kontrolü
+    col_ctrl, col_prog = st.columns([1.1, 2.9])
 
     with col_ctrl:
         st.subheader("🎮 Motor Kontrolü")
@@ -214,326 +387,243 @@ def render_clips_automation_tab():
             if st.button("🛑 Motoru Durdur", use_container_width=True):
                 clip_scheduler.stop()
                 st.rerun()
-        st.caption(f"**Mevcut Durum:** {clip_scheduler.current_status}")
-        window_note = "açık" if clip_publisher.is_within_publish_window(settings) else "kapalı"
-        st.caption(
-            f"Yayın penceresi: **{settings.publish_window_start_hour}:00 - {settings.publish_window_end_hour}:00** (şu an {window_note}) · "
-            f"Oto-yükleme: **{'açık' if settings.auto_upload else 'kapalı'}**"
-        )
 
-    with col_mode_info:
-        st.subheader("🌐 Çift Motor & AI Agent Portu")
-        st.markdown("""
-        - **1. Otonom Kural Modu:** Motoru başlatın; yayıncılar periyodik taranır, yeni içerikler stoğa eklenir,
-          kurgulanır ve günlük kotaya göre YouTube'a yüklenir.
-        - **2. Localhost AI Agent Portu:** Harici yapay zeka ajanları `http://127.0.0.1:8080/docs` üzerinden
-          tüm stok/kota/keşif komutlarını kullanabilir.
-        """)
+        is_prime, prime_slot = clip_publisher.is_prime_time_now(settings)
+        prime_badge = f"<span style='color: #00E676; font-weight: bold;'>Evet ({prime_slot})</span>" if is_prime else "<span style='color: #9fa8da;'>Hayır</span>"
 
-    st.markdown("---")
+        st.markdown(f"""
+            <div style="font-size: 13px; color: #b0bec5; line-height: 1.6; background: #161824; padding: 10px; border-radius: 8px; border: 1px solid #292d42;">
+                <div>🔥 <strong>Prime Time Saatleri:</strong> {settings.prime_time_slots}</div>
+                <div>⏰ <strong>Şu An Prime Time mı:</strong> {prime_badge}</div>
+                <div>📦 <strong>Hedef Stok:</strong> 3 Yatay · 6 Shorts</div>
+                <div>⚙️ <strong>İşleme Modu:</strong> Sıralı (1'er 1'er)</div>
+                <div>📤 <strong>Oto-Yükleme:</strong> {'Açık' if settings.auto_upload else 'Kapalı (Manuel)'}</div>
+            </div>
+        """, unsafe_allow_html=True)
 
-    col_left, col_right = st.columns([1.1, 1.9])
+    with col_prog:
+        st.subheader("⚡ Canlı İşlem Hattı & İlerleme")
+        _render_live_pipeline_panel()
 
-    with col_left:
-        # A. Yayinci Ekleme (URL ile)
-        with st.expander("📺 Yayıncı Listesi & Yeni Ekle", expanded=True):
-            with st.form("add_streamer_form", clear_on_submit=True):
-                streamer_url = st.text_input(
-                    "Yayıncı / Kesit Kanalı Adresi (URL)",
-                    placeholder="https://youtube.com/@rraenekesitleri · https://youtube.com/@elraenn · https://twitch.tv/kanal",
-                    help="Kanal adresini yapıştırın. Kaliteli ve güncel kesitler için doğrudan YouTube kesit kanalları önerilir."
-                )
-                fan_queries_input = st.text_input(
-                    "YouTube Fan / Kesit Kanalı Aramaları (Virgülle ayırın, Opsiyonel)",
-                    placeholder="Örn: rraenee kesitleri, rraenee klipleri",
-                    help="Belirtilen yayıncının YouTube hayran/kesit kanallarındaki viral anları taramak için arama terimleri."
-                )
-                col_f1, col_f2 = st.columns(2)
-                with col_f1:
-                    want_shorts = st.checkbox("📱 Dikey Shorts", value=True, help="Kliplerden altyazılı 9:16 üret")
-                with col_f2:
-                    want_horizontal = st.checkbox("🖥️ Yatay Video", value=True, help="VOD/YouTube videolarından 16:9 üret")
+    st.markdown("<hr style='margin: 15px 0; border: none; border-top: 1px solid #282c3f;'>", unsafe_allow_html=True)
 
-                col_v, col_m = st.columns(2)
-                with col_v:
-                    min_views = st.number_input("Min İzlenme Eşiği", min_value=0, value=100, step=50)
-                with col_m:
-                    interval_mins = st.number_input("Tarama Aralığı (dk)", min_value=15, value=60, step=15)
+    # 3. Medya Havuzu, Stok Yönetimi ve Ayarlar Sekmeleri
+    tab_ready_h, tab_ready_s, tab_downloaded, tab_published, tab_settings, tab_streamers = st.tabs([
+        f"🖥️ Yatay Stok ({quota['horizontal']['ready_in_stock']}/{quota['horizontal']['target_stock']})",
+        f"📱 Shorts Stok ({quota['shorts']['ready_in_stock']}/{quota['shorts']['target_stock']})",
+        f"📥 İndirilen Ham Dosyalar",
+        f"🎉 Yayınlananlar",
+        f"⚙️ Kurgu, Prime Time & YouTube Filtreleri",
+        f"📺 Yayıncı Listesi"
+    ])
 
-                submitted = st.form_submit_button("➕ Yayıncıyı Ekle", use_container_width=True)
-                if submitted:
-                    formats = []
-                    if want_shorts:
-                        formats.append("shorts")
-                    if want_horizontal:
-                        formats.append("horizontal")
-                    if not streamer_url.strip():
-                        st.error("Lütfen yayıncı adresini girin.")
-                    elif not formats:
-                        st.error("En az bir çıktı formatı seçin (Shorts / Yatay).")
-                    else:
-                        try:
-                            platform, channel_name = clip_downloader.parse_streamer_url(streamer_url)
-                            fan_queries = [q.strip() for q in fan_queries_input.split(",") if q.strip()] if fan_queries_input else []
-                            target = StreamerTarget(
-                                platform=platform,
-                                channel_name=channel_name,
-                                display_name=channel_name,
-                                formats=formats,
-                                min_views=min_views,
-                                check_interval_minutes=interval_mins,
-                                fan_channel_queries=fan_queries
-                            )
-                            clip_db.add_streamer(target)
-                            st.success(f"{PLATFORM_LABELS.get(platform, platform.value)} `{channel_name}` eklendi!")
-                            st.rerun()
-                        except ValueError as e:
-                            st.error(str(e))
+    # A. YATAY STOK SEKMESİ
+    with tab_ready_h:
+        st.markdown(f"#### 🖥️ Yatay Video Stok Havuzu (Hedef: {settings.target_stock_horizontal} Video)")
+        st.caption("Bu videolardan her gün Prime Time saatlerinde 3 tanesi YouTube'a yüklenir. Kalan 3 video yarının yedek stoğu olarak hazır tutulur.")
 
-            if streamers:
-                st.write("**Aktif Takip Edilen Yayıncılar:**")
-                for s in streamers:
-                    col_info, col_del = st.columns([3, 1])
-                    with col_info:
-                        fmt_badges = " ".join(FORMAT_LABELS.get(f, f.value) for f in s.formats)
-                        fan_info = f" · Kesitler: `{', '.join(s.fan_channel_queries)}`" if s.fan_channel_queries else ""
-                        st.markdown(
-                            f"**{PLATFORM_LABELS.get(s.platform, s.platform.value)}** `{s.channel_name}`  \n"
-                            f"{fmt_badges} · min {s.min_views} izlenme · tarama {s.check_interval_minutes} dk"
-                            f"{fan_info}"
-                        )
-                    with col_del:
-                        if st.button("🗑️ Sil", key=f"del_streamer_{s.id}"):
-                            clip_db.delete_streamer(s.id)
-                            st.rerun()
-            else:
-                st.info("Henüz eklenmiş bir yayıncı yok. Yukarıdan adres yapıştırın.")
+        ready_horizontal = clip_db.list_ready_clips(target_format=ClipTargetFormat.HORIZONTAL.value, limit=30)
+        if ready_horizontal:
+            for c in ready_horizontal:
+                _render_video_card(c, settings, is_stock=True)
+        else:
+            st.info("Yatay stokta hazır video bulunmuyor. Motor çalıştığında yayın geçmişlerinden 1'er 1'er indirilip hazırlanacaktır.")
 
-        # B. Kurgu, Kota & YouTube Ayarlari
-        with st.expander("⚙️ Kurgu, Kota & YouTube Ayarları", expanded=False):
-            with st.form("pipeline_settings_form"):
-                st.markdown("**📅 Günlük Yükleme Kontenjanı**")
-                col_q1, col_q2 = st.columns(2)
-                with col_q1:
-                    daily_shorts = st.number_input("Günlük Shorts limiti", min_value=0, max_value=10,
-                                                   value=settings.daily_shorts_limit, step=1)
-                with col_q2:
-                    daily_horizontal = st.number_input("Günlük Yatay limiti", min_value=0, max_value=10,
-                                                       value=settings.daily_horizontal_limit, step=1)
+    # B. SHORTS STOK SEKMESİ
+    with tab_ready_s:
+        st.markdown(f"#### 📱 Dikey Shorts Stok Havuzu (Hedef: {settings.target_stock_shorts} Video)")
+        st.caption("Kliplerden OpenShorts algoritması ile altyazılı üretilmiş 9:16 Shorts videoları. Günde 3 tane Prime Time saatlerinde yayınlanır, 6 tane stok hazır tutulur.")
 
-                col_w1, col_w2, col_w3 = st.columns(3)
-                with col_w1:
-                    publish_interval = st.number_input("Yükleme kontrol aralığı (dk)", min_value=30, max_value=720,
-                                                       value=settings.publish_interval_minutes, step=30)
-                with col_w2:
-                    window_start = st.number_input("Yayın penceresi başlangıç (saat)", min_value=0, max_value=23,
-                                                   value=settings.publish_window_start_hour, step=1)
-                with col_w3:
-                    window_end = st.number_input("Yayın penceresi bitiş (saat)", min_value=0, max_value=24,
-                                                 value=settings.publish_window_end_hour, step=1)
+        ready_shorts = clip_db.list_ready_clips(target_format=ClipTargetFormat.SHORTS.value, limit=30)
+        if ready_shorts:
+            for c in ready_shorts:
+                _render_video_card(c, settings, is_stock=True)
+        else:
+            st.info("Shorts stoğunda hazır video bulunmuyor. Motor çalıştığında klipler taranıp 1'er 1'er indirilip kurgulanacaktır.")
 
-                st.markdown("**🎬 Kurgu Ayarları**")
-                layout_opts = ["streamer_facecam", "blur_bg", "center_crop", "split"]
-                video_layout = st.selectbox(
-                    "Video Yerleşimi (9:16 Shorts)",
-                    options=layout_opts,
-                    format_func=lambda x: {
-                        "streamer_facecam": "OpenShorts Akıllı Yayıncı Düzeni (Facecam + Oyun)",
-                        "blur_bg": "Bulanık Arka Plan",
-                        "center_crop": "Merkez Odaklı Kırpma",
-                        "split": "Split Screen (Üst/Alt)"
-                    }.get(x, x),
-                    index=layout_opts.index(settings.video_layout) if settings.video_layout in layout_opts else 0
-                )
+    # C. İNDİRİLEN HAM DOSYALAR (RAW ARCHIVE)
+    with tab_downloaded:
+        st.markdown("#### 📥 İndirilen Ham Dosyalar (Kurgu Bekleyenler)")
+        st.caption("Diske indirilmiş fakat henüz kurgulanmamış videolar. İsterseniz buradan doğrudan 'Hemen Kurgula' butonuna basabilirsiniz.")
 
-                col_t1, col_t2 = st.columns(2)
-                with col_t1:
-                    intro_trim = st.number_input(
-                        "Intro Kırpma (sn)", min_value=0.0, max_value=60.0,
-                        value=float(settings.intro_trim_seconds), step=1.0,
-                        help="Videonun başındaki kanal intro/jenerik ve abone ol ekranını keser"
-                    )
-                with col_t2:
-                    outro_trim = st.number_input(
-                        "Outro Kırpma (sn)", min_value=0.0, max_value=60.0,
-                        value=float(settings.outro_trim_seconds), step=1.0,
-                        help="Videonun sonundaki bitiş kartı ve outro ekranını keser"
-                    )
+        downloaded_clips = clip_db.list_downloaded_clips(limit=25)
+        if downloaded_clips:
+            for c in downloaded_clips:
+                _render_video_card(c, settings, is_stock=False)
+        else:
+            st.info("Şu an diskte kurgu bekleyen ham video bulunmuyor.")
 
-                sub_enabled = st.checkbox(
-                    "Shorts için dinamik altyazı ekle (faster-whisper)",
-                    value=settings.subtitle_enabled,
-                    help="Yatay (16:9) videolara kullanıcı tercihi gereği altyazı hiç eklenmez."
-                )
-                ai_titles = st.checkbox("LLM ile viral başlık/açıklama üret", value=settings.ai_title_generation)
-                hook_overlay = st.checkbox(
-                    "Viral Kanca (Hook) Başlık Çıkartması Ekle (OpenShorts)",
-                    value=settings.hook_overlay_enabled,
-                    help="OpenShorts stili yüksek kontrastlı kanca çıkartmasını videonun ilk 7 saniyesinde gösterir."
-                )
-                llm_moments = st.checkbox(
-                    "OpenShorts LLM ile Akıllı Viral An & Kanca Tespiti",
-                    value=settings.llm_moment_detection,
-                    help="Whisper transkriptini LLM ile tarayarak en viral 20-55 saniyelik anı, vurucu kanca başlığını ve YouTube başlığını belirler."
-                )
+    # D. YAYINLANANLAR
+    with tab_published:
+        st.markdown("#### 🎉 YouTube'da Başarıyla Yayınlanan Videolar")
+        published_clips = clip_db.list_clips_by_status(status=ClipStatus.PUBLISHED, limit=30)
+        if published_clips:
+            for c in published_clips:
+                with st.container(border=True):
+                    col_p1, col_p2 = st.columns([3, 1])
+                    with col_p1:
+                        pub_time = c.published_at.strftime("%d.%m.%Y %H:%M") if c.published_at else "Bugün"
+                        fmt_icon = "📱 Shorts" if c.target_format == ClipTargetFormat.SHORTS else "🖥️ Yatay"
+                        st.markdown(f"**{c.title}**  \n`{fmt_icon}` · Yayınlanma: **{pub_time}** · Yayıncı: {c.channel_name}")
+                    with col_p2:
+                        if c.youtube_video_id:
+                            st.link_button("▶️ YouTube'da İzle", f"https://youtu.be/{c.youtube_video_id}", use_container_width=True)
+        else:
+            st.info("Henüz YouTube'da yayınlanan video kaydı yok.")
 
-                st.markdown("**📅 Güncellik, Viralite & Başlık Filtresi**")
-                col_age1, col_age2 = st.columns(2)
-                with col_age1:
-                    max_age = st.number_input(
-                        "Maksimum Video Yaşı (Gün)", min_value=1, max_value=365,
-                        value=int(settings.max_video_age_days), step=1,
-                        help="Örn: 7 gün. Bu süreden eski videolar elenir (günceli takip eder)."
-                    )
-                with col_age2:
-                    viral_baraj = st.number_input(
-                        "Eski Videolar İçin Viral Barajı (İzlenme)", min_value=1000, max_value=10000000,
-                        value=int(settings.viral_threshold_for_older), step=5000,
-                        help="Eski videolar sadece bu izlenme sayısını aşmışsa viral kabul edilip alınır."
-                    )
+    # E. GELİŞMİŞ AYARLAR & YOUTUBE FİLTRELERİ
+    with tab_settings:
+        st.markdown("#### ⚙️ Kurgu, Kota, Prime Time & YouTube Filtreleri")
 
-                blacklist_input = st.text_input(
-                    "Başlık Kara Listesi (Negatif Kelimeler)",
-                    value=settings.title_blacklist,
-                    help="Virgülle ayırın. Başlığında bu kelimeler geçen (ör: açıklama, sorun, duyuru) videolar indirilmez."
-                )
+        with st.form("advanced_pipeline_settings_form"):
+            st.markdown("##### 📅 Prime Time & Stok Kontenjanları")
+            c_s1, c_s2 = st.columns(2)
+            with c_s1:
+                target_stock_h = st.number_input("Yatay Stok Hedefi (Hazır Video)", min_value=1, max_value=20, value=settings.target_stock_horizontal)
+                daily_limit_h = st.number_input("Günlük Yatay Yayın Kotası", min_value=1, max_value=10, value=settings.daily_horizontal_limit)
+            with c_s2:
+                target_stock_s = st.number_input("Shorts Stok Hedefi (Hazır Video)", min_value=1, max_value=30, value=settings.target_stock_shorts)
+                daily_limit_s = st.number_input("Günlük Shorts Yayın Kotası", min_value=1, max_value=10, value=settings.daily_shorts_limit)
 
-                st.markdown("**🌐 Kaynak Platform Seçimi & Tarama**")
-                col_p1, col_p2 = st.columns(2)
-                with col_p1:
-                    enable_kick = st.checkbox(
-                        "Kick Kliplerini Tara",
-                        value=settings.enable_kick_discovery,
-                        help="Kick'teki alakasız duyuru kliplerini engellemek için varsayılan kapalıdır."
-                    )
-                with col_p2:
-                    enable_twitch = st.checkbox("Twitch Kliplerini Tara", value=settings.enable_twitch_discovery)
+            prime_slots_input = st.text_input(
+                "🔥 Prime Time Yayın Slotları (Saat:Dakika, virgülle ayırın)",
+                value=settings.prime_time_slots,
+                help="Günün en çok izlenme alan saatleri. Örn: 18:00, 20:00, 22:00. Sıradaki en viral videolar bu saatlerde yayınlanır."
+            )
 
-                yt_search = st.checkbox("YouTube'da yayıncı araması yap (kesit ve derlemeler)", value=settings.youtube_search_enabled)
-                yt_suffix = st.text_input(
-                    "YouTube Arama Eki",
-                    value=settings.youtube_query_suffix,
-                    help="Yayıncı adının yanına eklenecek anahtar kelimeler (örn: kesitleri klipleri)"
-                )
-                keep_raw = st.checkbox("Ham indirilen dosyaları sakla (disk kullanımı artar)", value=settings.keep_raw_files)
-
-                col_s1, col_s2 = st.columns(2)
-                with col_s1:
-                    stock_cap = st.number_input("Stok üst sınırı (format başına hazır video)",
-                                                min_value=1, max_value=100,
-                                                value=settings.stock_max_ready_per_format, step=1)
-                with col_s2:
-                    vod_max = st.number_input("Maksimum VOD süresi (dk)", min_value=15, max_value=600,
-                                              value=settings.vod_max_minutes, step=15)
-
-                st.markdown("**📤 YouTube**")
-                auto_yt = st.checkbox("Otomatik yükleme (günlük kota ile stoktan yayınla)", value=settings.auto_upload)
-                privacy = st.selectbox(
-                    "YouTube Varsayılan Gizlilik",
+            st.markdown("##### 📤 YouTube Yayın & Kategori Filtreleri")
+            c_y1, c_y2 = st.columns(2)
+            with c_y1:
+                auto_upload_toggle = st.checkbox("YouTube Otomatik Yayınlama Açık", value=settings.auto_upload)
+                privacy_opt = st.selectbox(
+                    "Varsayılan Gizlilik",
                     options=["private", "unlisted", "public"],
-                    format_func=lambda x: {"private": "Gizli (Taslak)", "unlisted": "Liste Dışı", "public": "Herkese Açık"}.get(x, x),
+                    format_func=lambda x: {"private": "Gizli (Taslak)", "unlisted": "Liste Dışı", "public": "Herkese Açık (Canlı)"}.get(x, x),
                     index=["private", "unlisted", "public"].index(settings.privacy_status)
                 )
+                auto_thumb_toggle = st.checkbox("Peak Hype Karelerinden Otomatik Kapak (Thumbnail) Üret", value=settings.auto_generate_thumbnail)
 
-                check_interval = st.slider("Genel Keşif Periyodu (Dakika)", min_value=15, max_value=240,
-                                           value=settings.check_interval_minutes, step=15)
+            with c_y2:
+                cat_keys = list(YOUTUBE_CATEGORIES.keys())
+                cur_cat = settings.youtube_category_id or "20"
+                c_idx = cat_keys.index(cur_cat) if cur_cat in cat_keys else 0
+                cat_select = st.selectbox(
+                    "Varsayılan YouTube Video Kategorisi",
+                    options=cat_keys,
+                    format_func=lambda k: YOUTUBE_CATEGORIES.get(k, k),
+                    index=c_idx
+                )
+                made_kids_toggle = st.checkbox("Çocuklara Özel İçerik (Made for Kids)", value=settings.made_for_kids)
+                age_restrict_toggle = st.checkbox("18+ Yaş Sınırı Uygula", value=settings.age_restricted)
 
-                save_settings_btn = st.form_submit_button("Kaydet", use_container_width=True)
-                if save_settings_btn:
-                    settings.video_layout = video_layout
-                    settings.hook_overlay_enabled = hook_overlay
-                    settings.llm_moment_detection = llm_moments
-                    settings.intro_trim_seconds = float(intro_trim)
-                    settings.outro_trim_seconds = float(outro_trim)
-                    settings.subtitle_enabled = sub_enabled
-                    settings.ai_title_generation = ai_titles
-                    settings.max_video_age_days = int(max_age)
-                    settings.viral_threshold_for_older = int(viral_baraj)
-                    settings.title_blacklist = blacklist_input.strip()
-                    settings.enable_kick_discovery = enable_kick
-                    settings.enable_twitch_discovery = enable_twitch
-                    settings.auto_upload = auto_yt
-                    settings.privacy_status = privacy
-                    settings.check_interval_minutes = check_interval
-                    settings.daily_shorts_limit = int(daily_shorts)
-                    settings.daily_horizontal_limit = int(daily_horizontal)
-                    settings.publish_interval_minutes = int(publish_interval)
-                    settings.publish_window_start_hour = int(window_start)
-                    settings.publish_window_end_hour = int(window_end)
-                    settings.youtube_search_enabled = yt_search
-                    settings.youtube_query_suffix = yt_suffix.strip()
-                    settings.keep_raw_files = keep_raw
-                    settings.stock_max_ready_per_format = int(stock_cap)
-                    settings.vod_max_minutes = int(vod_max)
-                    clip_db.save_settings(settings)
-                    st.success("Ayarlar başarıyla kaydedildi!")
-                    st.rerun()
+            st.markdown("##### 🎬 Kurgu & Intro/Outro Kesim")
+            c_k1, c_k2 = st.columns(2)
+            with c_k1:
+                intro_trim_val = st.number_input("Intro / Jenerik Kesme (sn)", min_value=0.0, max_value=60.0, value=float(settings.intro_trim_seconds), step=1.0)
+                sub_toggle = st.checkbox("Shorts için faster-whisper altyazı ekle", value=settings.subtitle_enabled)
+                llm_moment_toggle = st.checkbox("LLM ile Akıllı Viral An ve Kanca Tespiti", value=settings.llm_moment_detection)
+            with c_k2:
+                outro_trim_val = st.number_input("Outro / Bitiş Kartı Kesme (sn)", min_value=0.0, max_value=60.0, value=float(settings.outro_trim_seconds), step=1.0)
+                hook_toggle = st.checkbox("OpenShorts Kanca Başlık Çıkartması Ekle", value=settings.hook_overlay_enabled)
+                ai_title_toggle = st.checkbox("LLM ile YouTube Başlığı ve Etiketleri Üret", value=settings.ai_title_generation)
 
-        # C. Manuel Klip Isleme
-        with st.expander("🎯 Manuel URL ile Anlık Üret", expanded=False):
-            with st.form("manual_clip_form"):
-                clip_url = st.text_input("Video / Klip URL'si",
-                                         placeholder="https://clips.twitch.tv/... veya https://kick.com/... veya YouTube linki")
-                manual_format = st.radio("Çıktı formatı", options=["Dikey Shorts (altyazılı)", "Yatay Video (altyazısız)"],
-                                         horizontal=True)
-                col_cs, col_ce = st.columns(2)
-                with col_cs:
-                    manual_start = st.number_input("Başlangıç (sn, opsiyonel)", min_value=0.0, value=0.0, step=1.0)
-                with col_ce:
-                    manual_end = st.number_input("Bitiş (sn, opsiyonel, 0 = otomatik)", min_value=0.0, value=0.0, step=1.0)
-                direct_upload = st.checkbox("İşlem bittiğinde hemen YouTube'a yükle (kotadan bağımsız)", value=False)
+            st.markdown("##### 🔍 Güncellik & Negatif Filtreler")
+            c_f1, c_f2 = st.columns(2)
+            with c_f1:
+                max_age_val = st.number_input("Maksimum Video Yaşı (Gün)", min_value=1, max_value=365, value=int(settings.max_video_age_days))
+                blacklist_str = st.text_input("Başlık Kara Listesi (Negatif Kelimeler)", value=settings.title_blacklist)
+            with c_f2:
+                viral_baraj_val = st.number_input("Eski Videolar İçin Viralite Barajı (İzlenme)", min_value=1000, max_value=5000000, value=int(settings.viral_threshold_for_older), step=5000)
+                yt_search_toggle = st.checkbox("YouTube kesit araması yap", value=settings.youtube_search_enabled)
 
-                run_btn = st.form_submit_button("⚡ Hemen İndir ve Kurgula", use_container_width=True)
-                if run_btn:
-                    if not clip_url.strip():
+            save_btn = st.form_submit_button("💾 Tüm Ayarları Kaydet", use_container_width=True, type="primary")
+            if save_btn:
+                settings.target_stock_horizontal = int(target_stock_h)
+                settings.target_stock_shorts = int(target_stock_s)
+                settings.daily_horizontal_limit = int(daily_limit_h)
+                settings.daily_shorts_limit = int(daily_limit_s)
+                settings.prime_time_slots = prime_slots_input.strip()
+                settings.auto_upload = auto_upload_toggle
+                settings.privacy_status = privacy_opt
+                settings.auto_generate_thumbnail = auto_thumb_toggle
+                settings.youtube_category_id = cat_select
+                settings.made_for_kids = made_kids_toggle
+                settings.age_restricted = age_restrict_toggle
+                settings.intro_trim_seconds = float(intro_trim_val)
+                settings.outro_trim_seconds = float(outro_trim_val)
+                settings.subtitle_enabled = sub_toggle
+                settings.hook_overlay_enabled = hook_toggle
+                settings.llm_moment_detection = llm_moment_toggle
+                settings.ai_title_generation = ai_title_toggle
+                settings.max_video_age_days = int(max_age_val)
+                settings.viral_threshold_for_older = int(viral_baraj_val)
+                settings.title_blacklist = blacklist_str.strip()
+                settings.youtube_search_enabled = yt_search_toggle
+
+                clip_db.save_settings(settings)
+                clip_publisher.update_scheduled_times_in_db(settings)
+                st.success("Tüm ayarlar başarıyla güncellendi!")
+                st.rerun()
+
+    # F. YAYINCI LİSTESİ
+    with tab_streamers:
+        st.markdown("#### 📺 Takip Edilen Yayıncılar ve Kesit Kanalları")
+
+        with st.expander("➕ Yeni Yayıncı / Kesit Kanalı Ekle", expanded=True):
+            with st.form("add_streamer_form", clear_on_submit=True):
+                s_url = st.text_input(
+                    "Kanal / Yayıncı Adresi (URL)",
+                    placeholder="https://youtube.com/@rraenekesitleri · https://youtube.com/@elraenn · https://twitch.tv/kanal"
+                )
+                s_queries = st.text_input(
+                    "Fan / Kesit Arama Terimleri (Virgülle ayırın, Opsiyonel)",
+                    placeholder="Örn: rraenee kesitleri, rraenee klipleri"
+                )
+                c_sf1, c_sf2 = st.columns(2)
+                with c_sf1:
+                    w_shorts = st.checkbox("📱 Dikey Shorts Üret", value=True)
+                with c_sf2:
+                    w_horiz = st.checkbox("🖥️ Yatay Video Üret", value=True)
+
+                submit_s = st.form_submit_button("Yayıncıyı Kaydet", use_container_width=True)
+                if submit_s:
+                    if not s_url.strip():
                         st.error("Lütfen bir URL girin.")
                     else:
-                        url_value = clip_url.strip()
-                        if "kick.com" in url_value:
-                            plat = PlatformType.KICK
-                        elif "youtube.com" in url_value or "youtu.be" in url_value:
-                            plat = PlatformType.YOUTUBE
-                        else:
-                            plat = PlatformType.TWITCH
+                        try:
+                            plat, cname = clip_downloader.parse_streamer_url(s_url)
+                            fmts = []
+                            if w_shorts:
+                                fmts.append("shorts")
+                            if w_horiz:
+                                fmts.append("horizontal")
+                            f_list = [q.strip() for q in s_queries.split(",") if q.strip()]
+                            target = StreamerTarget(
+                                platform=plat,
+                                channel_name=cname,
+                                display_name=cname,
+                                formats=fmts,
+                                fan_channel_queries=f_list
+                            )
+                            clip_db.add_streamer(target)
+                            st.success(f"{PLATFORM_LABELS.get(plat, plat.value)} `{cname}` eklendi!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
-                        fmt = (ClipTargetFormat.SHORTS if manual_format.startswith("Dikey")
-                               else ClipTargetFormat.HORIZONTAL)
-                        clip_obj = ClipItem(
-                            clip_id=f"manual_{abs(hash(url_value)) % 1000000}",
-                            source_key=f"manual_{abs(hash(url_value)) % 1000000}",
-                            platform=plat,
-                            channel_name="manual",
-                            title="Manuel Video",
-                            url=url_value,
-                            target_format=fmt,
-                            status=ClipStatus.DISCOVERED
-                        )
-                        clip_db.save_clip(clip_obj)
-
-                        def _manual_run(c=clip_obj, s=manual_start, e=manual_end, pub=direct_upload):
-                            try:
-                                clip_scheduler.run_single_pipeline_for_clip(
-                                    c,
-                                    custom_start_sec=s if s > 0 else None,
-                                    custom_end_sec=e if e > 0 else None,
-                                    publish_now=pub
-                                )
-                            except Exception as ex:
-                                logger.error(f"Manual clip run failed: {ex}")
-
-                        _start_background(_manual_run)
-                        st.success("İşlem arka planda başlatıldı! İlerlemeyi canlı loglardan takip edebilirsiniz.")
-                        st.rerun()
-
-    with col_right:
-        _render_log_panel()
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # Stok Tarayici
-        st.subheader("📦 Stok & Önizleme")
-        tab_h, tab_s = st.tabs(["🖥️ Yatay Stok", "📱 Shorts Stok"])
-        with tab_h:
-            _render_stock_tab(ClipTargetFormat.HORIZONTAL, settings)
-        with tab_s:
-            _render_stock_tab(ClipTargetFormat.SHORTS, settings)
+        all_streamers = clip_db.list_streamers()
+        if all_streamers:
+            for s in all_streamers:
+                with st.container(border=True):
+                    c_info, c_act = st.columns([3, 1])
+                    with c_info:
+                        f_badges = " ".join(FORMAT_LABELS.get(f, f.value) for f in s.formats)
+                        st.markdown(f"**{PLATFORM_LABELS.get(s.platform, s.platform.value)}** `{s.channel_name}`  \n{f_badges}")
+                        if s.fan_channel_queries:
+                            st.caption(f"Kesit aramaları: `{', '.join(s.fan_channel_queries)}`")
+                    with c_act:
+                        if st.button("🗑️ Sil", key=f"del_streamer_{s.id}", use_container_width=True):
+                            clip_db.delete_streamer(s.id)
+                            st.rerun()
+        else:
+            st.info("Kayıtlı yayıncı bulunmuyor.")

@@ -161,11 +161,38 @@ class ShortsPublisherService:
         video_aspect: str
     ) -> Optional[str]:
         """Ortak YouTube yukleme ve durum guncelleme akisi."""
+        from app.services.video_progress_tracker import video_progress_tracker
+        from app.services.hype_detector import hype_detector
+
+        settings = clip_db.get_settings()
         logger.info(
             f"Uploading clip '{clip.clip_id}' to YouTube "
             f"({clip.target_format.value}, aspect={video_aspect}, privacy={privacy})..."
         )
         clip_db.update_clip_status(clip.clip_id, ClipStatus.UPLOADING)
+        video_progress_tracker.update_stage(
+            stage="uploading",
+            stage_label="YouTube'a Yükleniyor (%95)",
+            percent=95.0,
+            detail=f"YouTube'a yükleniyor: {title[:45]}"
+        )
+
+        # Thumbnail secimi / otomatik uretimi
+        thumb_path = clip.custom_thumbnail_path
+        if (not thumb_path or not os.path.exists(thumb_path)) and settings.auto_generate_thumbnail:
+            try:
+                base_dir = os.path.dirname(clip.processed_video_path)
+                stem = os.path.splitext(os.path.basename(clip.processed_video_path))[0]
+                auto_thumb = os.path.join(base_dir, f"{stem}_thumb.jpg")
+                sample_time = max(1.0, clip.cut_start_sec + 2.0 if clip.cut_start_sec else 2.0)
+                if hype_detector.extract_thumbnail_frame(clip.processed_video_path, sample_time, auto_thumb):
+                    thumb_path = auto_thumb
+                    clip.custom_thumbnail_path = auto_thumb
+            except Exception as thumb_err:
+                logger.warning(f"Auto thumbnail generation failed: {thumb_err}")
+
+        category_id = clip.youtube_category_id or settings.youtube_category_id or "20"
+        made_for_kids = clip.made_for_kids if clip.made_for_kids is not None else settings.made_for_kids
 
         try:
             result = upload_to_youtube(
@@ -174,7 +201,10 @@ class ShortsPublisherService:
                 description=description,
                 tags=tags,
                 privacy_status=privacy,
-                video_aspect=video_aspect
+                video_aspect=video_aspect,
+                thumbnail_path=thumb_path,
+                category_id=category_id,
+                made_for_kids=made_for_kids,
             )
 
             # youtube_uploader ya dict dondurur ya da video_id string
@@ -204,16 +234,23 @@ class ShortsPublisherService:
                 youtube_description=description,
                 youtube_tags=tags,
                 youtube_status=privacy,
+                custom_thumbnail_path=thumb_path,
                 published_at=published_now
             )
 
             logger.info(f"Clip successfully published to YouTube: https://youtu.be/{video_id}")
+            video_progress_tracker.finish_task(
+                clip.clip_id,
+                success=True,
+                result_path=f"https://youtu.be/{video_id}"
+            )
             return video_id
 
         except Exception as e:
             err_msg = f"YouTube upload failed: {str(e)}"
             logger.error(err_msg)
             clip_db.update_clip_status(clip.clip_id, ClipStatus.FAILED, error_message=err_msg)
+            video_progress_tracker.finish_task(clip.clip_id, success=False, error=err_msg)
             raise
 
 

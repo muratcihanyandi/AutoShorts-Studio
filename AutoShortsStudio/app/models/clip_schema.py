@@ -91,12 +91,17 @@ class ClipItem(BaseModel):
     # Yayin onceligi (yuksek olan once yuklenir)
     priority: int = 0
 
-    # YouTube verileri
+    # YouTube verileri & Filtreleri
     youtube_title: Optional[str] = None
     youtube_description: Optional[str] = None
     youtube_tags: Optional[List[str]] = None
     youtube_video_id: Optional[str] = None
     youtube_status: Optional[str] = None
+    youtube_category_id: Optional[str] = None
+    made_for_kids: bool = False
+    age_restricted: bool = False
+    custom_thumbnail_path: Optional[str] = None
+    scheduled_publish_time: Optional[datetime] = None
     published_at: Optional[datetime] = None
 
     error_message: Optional[str] = None
@@ -112,13 +117,24 @@ class ClipPipelineSettings(BaseModel):
     # Gunluk yukleme kontenjanlari
     daily_shorts_limit: int = 3
     daily_horizontal_limit: int = 3
-    publish_interval_minutes: int = 120
+    publish_interval_minutes: int = 30
     publish_window_start_hour: int = 9   # yerel saat
-    publish_window_end_hour: int = 22    # yerel saat
+    publish_window_end_hour: int = 24    # yerel saat
 
-    # Stok yonetimi
+    # Prime Time & Akilli Yayinlama
+    prime_time_slots: str = "18:00, 20:00, 22:00"  # En yuksek etkilesim saatleri (Slot 1, Slot 2, Slot 3)
+
+    # Hedef Stok Yonetimi (Yatay: 3, Shorts: 6)
+    target_stock_horizontal: int = 3
+    target_stock_shorts: int = 6
     stock_max_ready_per_format: int = 15
     keep_raw_files: bool = False
+
+    # YouTube Filtre & Kategori Ayarlari
+    youtube_category_id: str = "20"         # 20: Gaming, 22: People & Blogs, 24: Entertainment
+    made_for_kids: bool = False             # Cocuklara ozel icerik mi?
+    age_restricted: bool = False            # 18+ yas siniri
+    auto_generate_thumbnail: bool = True    # Peak hype karelerinden otomatik kapak gorseli uret
 
     # Shorts kurgusu & OpenShorts Modeli
     video_layout: str = "streamer_facecam"    # streamer_facecam, blur_bg, center_crop, split

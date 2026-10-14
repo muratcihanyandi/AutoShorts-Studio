@@ -31,6 +31,7 @@ class ClipSchedulerService:
         self._stop_event = threading.Event()
         self._is_running = False
         self._lock = threading.Lock()
+        self._pipeline_lock = threading.Lock()
         self._logs: List[Dict[str, Any]] = []
         self._current_task_info = "Beklemede (Idle)"
 
@@ -117,51 +118,79 @@ class ClipSchedulerService:
         if settings is None:
             settings = clip_db.get_settings()
 
-        try:
-            fmt_label = "Yatay" if clip.target_format == ClipTargetFormat.HORIZONTAL else "Shorts"
-            self._add_log(f"İşleniyor ({fmt_label}): '{clip.title}' ({clip.channel_name} - {clip.platform.value})", "info")
-            clip_db.save_clip(clip)
+        with self._pipeline_lock:
+            from app.services.video_progress_tracker import video_progress_tracker
+            video_progress_tracker.start_task(
+                clip_id=clip.clip_id,
+                title=clip.title,
+                channel_name=clip.channel_name,
+                target_format=clip.target_format.value,
+                platform=clip.platform.value,
+                thumbnail_url=clip.thumbnail_url,
+                duration=clip.duration,
+            )
+            try:
+                fmt_label = "Yatay" if clip.target_format == ClipTargetFormat.HORIZONTAL else "Shorts"
+                self._add_log(f"İşleniyor ({fmt_label}): '{clip.title}' ({clip.channel_name} - {clip.platform.value})", "info")
+                clip_db.save_clip(clip)
 
-            # 1. Indirme (onceden inmis ise indirme atlanir, ayni kaynagin ikizleri tek dosyayi paylasir)
-            raw_path = clip.raw_video_path
-            if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 10240:
-                self._add_log(f"Zaten indirilmis video kullaniliyor (indirme atlandi): {os.path.basename(raw_path)}", "info")
-            else:
-                self._current_task_info = f"İndiriliyor: {clip.title[:30]}"
-                self._add_log(f"Video indiriliyor: {clip.url}", "info")
-                raw_path = clip_downloader.download_clip(clip)
-
-            if clip.target_format == ClipTargetFormat.HORIZONTAL:
-                publish_target = self._process_horizontal(clip, raw_path, settings,
-                                                          custom_start_sec, custom_end_sec)
-            else:
-                publish_target = self._process_shorts(clip, raw_path, settings,
-                                                      custom_start_sec, custom_end_sec)
-
-            # Ham dosya temizligi (ayni kaynagin bekleyen ikizi yoksa)
-            self._cleanup_raw(raw_path, clip, settings)
-
-            # 2. Hemen yukleme (yalnizca acik istek uzerine; normalde kota yayinlayicisi yukler)
-            if publish_now:
-                if shorts_publisher.is_youtube_ready():
-                    self._current_task_info = f"YouTube'a yükleniyor: {clip.title[:30]}"
-                    self._add_log(f"YouTube'a yukleniyor ({publish_target.target_format.value})...", "info")
-                    video_id = shorts_publisher.publish_clip(publish_target, settings=settings)
-                    self._add_log(f"Video YouTube'a yuklendi! ID: {video_id}", "info")
+                # 1. Indirme (onceden inmis ise indirme atlanir, ayni kaynagin ikizleri tek dosyayi paylasir)
+                raw_path = clip.raw_video_path
+                if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 10240:
+                    self._add_log(f"Zaten indirilmis video kullaniliyor (indirme atlandi): {os.path.basename(raw_path)}", "info")
+                    video_progress_tracker.update_stage(
+                        stage="downloaded",
+                        stage_label="Önbellekten Alındı (%35)",
+                        percent=35.0,
+                        detail="Önceden indirilmiş yerel video dosyası kullanılıyor."
+                    )
                 else:
-                    self._add_log("YouTube token bulunamadi veya bagli degil, video READY olarak bekletiliyor.", "warning")
-            else:
-                self._add_log("Video READY olarak stokta bekliyor; gunluk kota ile otomatik yayinlanacak.", "info")
+                    self._current_task_info = f"İndiriliyor: {clip.title[:30]}"
+                    self._add_log(f"Video indiriliyor: {clip.url}", "info")
+                    raw_path = clip_downloader.download_clip(clip)
 
-            self._current_task_info = "Beklemede"
-            return clip
+                if clip.target_format == ClipTargetFormat.HORIZONTAL:
+                    publish_target = self._process_horizontal(clip, raw_path, settings,
+                                                              custom_start_sec, custom_end_sec)
+                else:
+                    publish_target = self._process_shorts(clip, raw_path, settings,
+                                                          custom_start_sec, custom_end_sec)
 
-        except Exception as e:
-            err = f"Pipeline hatasi ({clip.clip_id}): {str(e)}"
-            self._add_log(err, "error")
-            self._current_task_info = f"Hata: {str(e)[:30]}"
-            clip_db.update_clip_status(clip.clip_id, ClipStatus.FAILED, error_message=err)
-            raise
+                # Ham dosya temizligi (ayni kaynagin bekleyen ikizi yoksa)
+                self._cleanup_raw(raw_path, clip, settings)
+
+                # 2. Hemen yukleme (yalnizca acik istek uzerine; normalde kota yayinlayicisi yukler)
+                if publish_now:
+                    if shorts_publisher.is_youtube_ready():
+                        self._current_task_info = f"YouTube'a yükleniyor: {clip.title[:30]}"
+                        self._add_log(f"YouTube'a yukleniyor ({publish_target.target_format.value})...", "info")
+                        video_id = shorts_publisher.publish_clip(publish_target, settings=settings)
+                        self._add_log(f"Video YouTube'a yuklendi! ID: {video_id}", "info")
+                    else:
+                        self._add_log("YouTube token bulunamadi veya bagli degil, video READY olarak bekletiliyor.", "warning")
+                        video_progress_tracker.finish_task(
+                            clip.clip_id,
+                            success=True,
+                            result_path=publish_target.processed_video_path or ""
+                        )
+                else:
+                    self._add_log("Video READY olarak stokta bekliyor; gunluk kota ile otomatik yayinlanacak.", "info")
+                    video_progress_tracker.finish_task(
+                        clip.clip_id,
+                        success=True,
+                        result_path=publish_target.processed_video_path or ""
+                    )
+
+                self._current_task_info = "Beklemede"
+                return clip
+
+            except Exception as e:
+                err = f"Pipeline hatasi ({clip.clip_id}): {str(e)}"
+                self._add_log(err, "error")
+                self._current_task_info = f"Hata: {str(e)[:30]}"
+                clip_db.update_clip_status(clip.clip_id, ClipStatus.FAILED, error_message=err)
+                video_progress_tracker.finish_task(clip.clip_id, success=False, error=err)
+                raise
 
     def _process_shorts(
         self,
@@ -172,6 +201,15 @@ class ClipSchedulerService:
         custom_end_sec: Optional[float]
     ) -> ClipItem:
         """Shorts hatti: LLM viral an / ses tepe noktasi (hype) penceresi + hook + 9:16 + altyazi."""
+        from app.services.video_progress_tracker import video_progress_tracker
+
+        video_progress_tracker.update_stage(
+            stage="analyzing",
+            stage_label="Viral An & Hype Analizi (%45)",
+            percent=45.0,
+            detail="LLM ve ses seviye analizi ile en vurucu 30-50sn taranıyor..."
+        )
+
         if (custom_start_sec is not None and custom_end_sec is not None
                 and custom_end_sec > custom_start_sec):
             start_sec, end_sec = custom_start_sec, custom_end_sec
@@ -206,6 +244,7 @@ class ClipSchedulerService:
                                     transcript_str = sf.read()
                                 try:
                                     os.remove(sub_file)
+                                    os.remove(temp_audio)
                                 except Exception:
                                     pass
                     except Exception as ex:
@@ -265,11 +304,40 @@ class ClipSchedulerService:
 
         self._current_task_info = f"9:16 Kurgu ve Altyazı: {clip.title[:30]}"
         self._add_log(f"9:16 dikey donusturme ve altyazi isleniyor ({start_sec:.1f}s - {end_sec:.1f}s)...", "info")
+        video_progress_tracker.update_stage(
+            stage="rendering",
+            stage_label="9:16 Kurgu & Altyazı Render (%70)",
+            percent=70.0,
+            detail=f"Dikey yerleşim ve altyazılar işleniyor ({start_sec:.1f}s - {end_sec:.1f}s)..."
+        )
         clip_editor.process_clip_to_shorts(
             clip,
             settings=settings,
             cut_start_sec=start_sec,
             cut_end_sec=end_sec
+        )
+
+        # Otomatik thumbnail yakalama
+        if settings.auto_generate_thumbnail and clip.processed_video_path and os.path.exists(clip.processed_video_path):
+            video_progress_tracker.update_stage(
+                stage="thumbnail",
+                stage_label="Kapak Görseli Çıkarılıyor (%90)",
+                percent=90.0,
+                detail="Viral andan yüksek çözünürlüklü kapak karesi yakalanıyor..."
+            )
+            base_dir = os.path.dirname(clip.processed_video_path)
+            stem = os.path.splitext(os.path.basename(clip.processed_video_path))[0]
+            thumb_file = os.path.join(base_dir, f"{stem}_thumb.jpg")
+            sample_time = max(1.0, (end_sec - start_sec) * 0.3)
+            if hype_detector.extract_thumbnail_frame(clip.processed_video_path, sample_time, thumb_file):
+                clip.custom_thumbnail_path = thumb_file
+                clip_db.update_clip_metadata(clip.clip_id, custom_thumbnail_path=thumb_file)
+
+        video_progress_tracker.update_stage(
+            stage="ready",
+            stage_label="Stokta Hazırlandı (%100)",
+            percent=100.0,
+            detail="Shorts kurgusu tamamlandı ve stok havuzuna eklendi."
         )
         return clip
 
@@ -285,6 +353,15 @@ class ClipSchedulerService:
         Yatay hat: intro/outro kirpma, govde korunur, altyazi eklenmez.
         Uzun VOD'lar parcalara bolunur; ilk parca aninda yuklenebilir hedef olur.
         """
+        from app.services.video_progress_tracker import video_progress_tracker
+
+        video_progress_tracker.update_stage(
+            stage="analyzing",
+            stage_label="Intro / Outro Kırpma Analizi (%45)",
+            percent=45.0,
+            detail=f"Başlangıçtan {settings.intro_trim_seconds}s, sondan {settings.outro_trim_seconds}s analiz ediliyor..."
+        )
+
         if custom_start_sec is not None or custom_end_sec is not None:
             start_sec = custom_start_sec or 0.0
             end_sec = custom_end_sec or 0.0
@@ -304,6 +381,12 @@ class ClipSchedulerService:
 
         self._current_task_info = f"Yatay kurgu: {clip.title[:30]}"
         self._add_log(f"Yatay (16:9) kurgu yapiliyor ({start_sec:.1f}s - {end_sec:.1f}s), altyazi eklenmiyor...", "info")
+        video_progress_tracker.update_stage(
+            stage="rendering",
+            stage_label="16:9 Video Kurgulanıyor (%75)",
+            percent=75.0,
+            detail=f"16:9 yatay video jenerikler kırpılarak paketleniyor ({start_sec:.1f}s - {end_sec:.1f}s)..."
+        )
         ready_items = clip_editor.process_clip_horizontal(
             clip,
             settings=settings,
@@ -311,12 +394,36 @@ class ClipSchedulerService:
             cut_end_sec=end_sec
         )
 
+        ready_item = ready_items[0] if ready_items else clip
+
+        if settings.auto_generate_thumbnail and ready_item.processed_video_path and os.path.exists(ready_item.processed_video_path):
+            video_progress_tracker.update_stage(
+                stage="thumbnail",
+                stage_label="Kapak Görseli Çıkarılıyor (%90)",
+                percent=90.0,
+                detail="Yatay video için kapak karesi yakalanıyor..."
+            )
+            base_dir = os.path.dirname(ready_item.processed_video_path)
+            stem = os.path.splitext(os.path.basename(ready_item.processed_video_path))[0]
+            thumb_file = os.path.join(base_dir, f"{stem}_thumb.jpg")
+            sample_time = max(5.0, min(30.0, ready_item.duration * 0.2 if ready_item.duration else 10.0))
+            if hype_detector.extract_thumbnail_frame(ready_item.processed_video_path, sample_time, thumb_file):
+                ready_item.custom_thumbnail_path = thumb_file
+                clip_db.update_clip_metadata(ready_item.clip_id, custom_thumbnail_path=thumb_file)
+
+        video_progress_tracker.update_stage(
+            stage="ready",
+            stage_label="Stokta Hazırlandı (%100)",
+            percent=100.0,
+            detail="Yatay video kurgusu tamamlandı ve stok havuzuna eklendi."
+        )
+
         if len(ready_items) > 1:
             self._add_log(
                 f"VOD {len(ready_items)} parcaya bolundu; parcalar stokta READY olarak bekliyor.",
                 "info"
             )
-        return ready_items[0] if ready_items else clip
+        return ready_item
 
     def _cleanup_raw(self, raw_path: str, clip: ClipItem, settings: ClipPipelineSettings):
         """keep_raw_files kapaliysa ve ayni kaynagin bekleyen ikizi yoksa ham dosyayi siler."""
@@ -441,34 +548,43 @@ class ClipSchedulerService:
                 self._add_log(f"{streamer.channel_name} tarama hatasi: {str(ex)[:150]}", "error")
 
     def _process_stock(self, settings: ClipPipelineSettings):
-        """Stok ust siniri dolmadikca bekleyen ogeleri isleme alir."""
-        max_ready = max(0, settings.stock_max_ready_per_format)
+        """
+        Stok hedeflerine gore (Yatay: 3, Shorts: 6) sirali olarak 1'er 1'er video indirip isler.
+        Ayni anda birden fazla video indirilmez veya kurgulanmaz.
+        """
+        target_h = max(1, settings.target_stock_horizontal)
+        target_s = max(1, settings.target_stock_shorts)
 
-        for fmt, label in (
-            (ClipTargetFormat.SHORTS, "Shorts"),
-            (ClipTargetFormat.HORIZONTAL, "Yatay"),
-        ):
-            if self._stop_event.is_set():
-                break
+        ready_h = clip_db.count_clips(status=ClipStatus.READY.value, target_format=ClipTargetFormat.HORIZONTAL.value)
+        ready_s = clip_db.count_clips(status=ClipStatus.READY.value, target_format=ClipTargetFormat.SHORTS.value)
 
-            processed_this_tick = 0
-            while processed_this_tick < 2:
-                if self._stop_event.is_set():
-                    break
-                ready_count = clip_db.count_clips(status=ClipStatus.READY.value, target_format=fmt.value)
-                if ready_count >= max_ready:
-                    break
-
-                next_clip = clip_db.next_discovered_clip(fmt.value)
-                if next_clip is None:
-                    break
-
+        # 1. Yatay stok oncelikli kontrolu (hedef: 3 hazir video)
+        if ready_h < target_h and not self._stop_event.is_set():
+            next_h = clip_db.next_discovered_clip(ClipTargetFormat.HORIZONTAL.value)
+            if next_h:
+                self._add_log(
+                    f"Yatay stok eksik ({ready_h}/{target_h}). 1 video sirayla indiriliyor ve isleniyor: '{next_h.title[:45]}'",
+                    "info"
+                )
                 try:
-                    self.run_single_pipeline_for_clip(next_clip, settings)
-                    processed_this_tick += 1
+                    self.run_single_pipeline_for_clip(next_h, settings)
                 except Exception as ex:
-                    self._add_log(f"Stok isleme hatasi ({next_clip.clip_id}): {str(ex)[:120]}", "error")
-                    break  # Ayni turda sonsuz denemeyi onle
+                    self._add_log(f"Yatay stok isleme hatasi ({next_h.clip_id}): {str(ex)[:120]}", "error")
+                return  # 1 video tamamlandi, diger videolara sirayla gecmek uzere donguye don
+
+        # 2. Shorts stok kontrolu (hedef: 6 hazir video)
+        if ready_s < target_s and not self._stop_event.is_set():
+            next_s = clip_db.next_discovered_clip(ClipTargetFormat.SHORTS.value)
+            if next_s:
+                self._add_log(
+                    f"Shorts stok eksik ({ready_s}/{target_s}). 1 video sirayla indiriliyor ve isleniyor: '{next_s.title[:45]}'",
+                    "info"
+                )
+                try:
+                    self.run_single_pipeline_for_clip(next_s, settings)
+                except Exception as ex:
+                    self._add_log(f"Shorts stok isleme hatasi ({next_s.clip_id}): {str(ex)[:120]}", "error")
+                return  # 1 video tamamlandi, diger videolara sirayla gecmek uzere donguye don
 
     def _publish_tick(self, settings: ClipPipelineSettings):
         """Gunluk kota ve yayin penceresi dahilinde stoktan YouTube'a yukler."""

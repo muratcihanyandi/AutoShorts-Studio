@@ -395,12 +395,18 @@ class YouTubeUploaderService:
         privacy_status: Optional[str] = None,
         video_aspect: Optional[str] = "9:16",
         thumbnail_path: Optional[str] = None,
+        category_id: Optional[str] = None,
+        made_for_kids: Optional[bool] = None,
+        publish_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Uploads a video to YouTube.
         - If video_aspect is 9:16 (portrait): uploaded as YouTube Shorts with #Shorts routing.
         - If video_aspect is 16:9 (landscape): uploaded as a standard YouTube video.
         - If thumbnail_path is provided: sets the custom thumbnail on the uploaded video.
+        - If category_id is provided: overrides default channel category (e.g. 20 for Gaming).
+        - If made_for_kids is provided: sets selfDeclaredMadeForKids flag.
+        - If publish_at is provided: sets scheduled release time (when privacy_status is private).
         """
         if not os.path.exists(video_path):
             logger.error(f"Video file not found: {video_path}")
@@ -455,17 +461,24 @@ class YouTubeUploaderService:
             # Remove #shorts hashtags from description for horizontal videos
             final_desc = re.sub(r"#shorts\b", "", final_desc, flags=re.IGNORECASE).strip()
 
+        target_category = str(category_id or self.category_id or "20")
+        is_kids = bool(made_for_kids) if made_for_kids is not None else False
+
+        status_dict: Dict[str, Any] = {
+            "privacyStatus": effective_privacy,
+            "selfDeclaredMadeForKids": is_kids,
+        }
+        if publish_at and effective_privacy == "private":
+            status_dict["publishAt"] = publish_at
+
         body = {
             "snippet": {
                 "title": clean_title,
                 "description": final_desc,
                 "tags": final_tags,
-                "categoryId": self.category_id,
+                "categoryId": target_category,
             },
-            "status": {
-                "privacyStatus": effective_privacy,
-                "selfDeclaredMadeForKids": False,
-            },
+            "status": status_dict,
         }
 
         try:
@@ -549,6 +562,9 @@ def upload_to_youtube(
     privacy_status: Optional[str] = None,
     video_aspect: Optional[str] = "9:16",
     thumbnail_path: Optional[str] = None,
+    category_id: Optional[str] = None,
+    made_for_kids: Optional[bool] = None,
+    publish_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     return youtube_uploader_service.upload_video(
         video_path=video_path,
@@ -558,4 +574,7 @@ def upload_to_youtube(
         privacy_status=privacy_status,
         video_aspect=video_aspect,
         thumbnail_path=thumbnail_path,
+        category_id=category_id,
+        made_for_kids=made_for_kids,
+        publish_at=publish_at,
     )
