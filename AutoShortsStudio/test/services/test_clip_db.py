@@ -286,6 +286,45 @@ class TestClipDatabase(unittest.TestCase):
         self.assertEqual(updated.hook_text, "Yeni Hook 🚀")
         self.assertEqual(updated.viral_score, 10)
 
+    def test_recover_interrupted_clips(self):
+        """Yarim kalan downloading, editing, analyzing klipleri kurtarilmali."""
+        # 1. editing durumunda ve raw dosyasi var -> DOWNLOADED olmali
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(b"x" * 20000)
+            temp_raw = f.name
+
+        try:
+            interrupted = ClipItem(
+                clip_id="interrupted_edit", platform=PlatformType.YOUTUBE, channel_name="test",
+                title="test", url="http://test", status=ClipStatus.EDITING,
+                raw_video_path=temp_raw
+            )
+            interrupted_missing = ClipItem(
+                clip_id="interrupted_download", platform=PlatformType.YOUTUBE, channel_name="test",
+                title="test", url="http://test", status=ClipStatus.DOWNLOADING,
+                raw_video_path="/non/existent/path.mp4"
+            )
+            self.db.save_clip(interrupted)
+            self.db.save_clip(interrupted_missing)
+
+            stats = self.db.recover_interrupted_clips()
+            self.assertEqual(stats["recovered_downloaded"], 1)
+            self.assertEqual(stats["recovered_discovered"], 1)
+
+            c1 = self.db.get_clip_by_id("interrupted_edit")
+            self.assertEqual(c1.status, ClipStatus.DOWNLOADED)
+
+            c2 = self.db.get_clip_by_id("interrupted_download")
+            self.assertEqual(c2.status, ClipStatus.DISCOVERED)
+
+            # next_discovered_clip oncelikle DOWNLOADED olanı almali
+            next_clip = self.db.next_discovered_clip(ClipTargetFormat.SHORTS.value)
+            self.assertEqual(next_clip.clip_id, "interrupted_edit")
+        finally:
+            if os.path.exists(temp_raw):
+                os.remove(temp_raw)
+
 
 if __name__ == "__main__":
     unittest.main()

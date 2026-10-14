@@ -3,7 +3,7 @@ import os
 import json
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict
 from loguru import logger
 
 from app.utils import utils
@@ -382,15 +382,15 @@ class ClipDatabase:
             return int(cursor.fetchone()["cnt"])
 
     def next_discovered_clip(self, target_format: str) -> Optional[ClipItem]:
-        """Stokta islenmeyi bekleyen bir sonraki klip (populerligi yuksek oncelikli)."""
+        """Stokta islenmeyi bekleyen bir sonraki klip (onceden indirilmisler oncelikli, sonra populerlik)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT * FROM clips
-                WHERE status = ? AND target_format = ?
-                ORDER BY view_count DESC, id ASC
+                WHERE status IN (?, ?) AND target_format = ?
+                ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, view_count DESC, id ASC
                 LIMIT 1
-            """, (ClipStatus.DISCOVERED.value, target_format))
+            """, (ClipStatus.DOWNLOADED.value, ClipStatus.DISCOVERED.value, target_format, ClipStatus.DOWNLOADED.value))
             r = cursor.fetchone()
             return self._row_to_clip(r) if r else None
 
@@ -523,6 +523,81 @@ class ClipDatabase:
                 INSERT OR REPLACE INTO settings (key, value) VALUES ('pipeline_settings', ?)
             """, (settings.model_dump_json(),))
             conn.commit()
+
+    def recover_interrupted_clips(self) -> Dict[str, int]:
+        """
+        Uygulama aniden kapandiginda veya yeniden baslatildiginda yarim kalan
+        (downloading, analyzing, editing, uploading) tum klipleri diskteki dosya durumuna gore
+        kurtarir:
+        - processed_video_path diskte varsa ve >10KB ise -> READY (yayinlanmaya hazir)
+        - raw_video_path diskte varsa ve >10KB ise -> DOWNLOADED (tekrar indirmeden kurguya devam)
+        - hicbir dosya yoksa -> DISCOVERED (bastan indirilecek)
+        Ayrica eski klasor yollarini normalize eder.
+        """
+        stats = {"recovered_ready": 0, "recovered_downloaded": 0, "recovered_discovered": 0}
+        transient_statuses = (
+            ClipStatus.DOWNLOADING.value,
+            ClipStatus.ANALYZING.value,
+            ClipStatus.EDITING.value,
+            ClipStatus.UPLOADING.value,
+        )
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # 1. Eski yol referanslarini normalize et
+            cursor.execute("""
+                UPDATE clips
+                SET raw_video_path = REPLACE(raw_video_path, 'MoneyPrinterTurbo', 'AutoShortsStudio')
+                WHERE raw_video_path LIKE '%MoneyPrinterTurbo%'
+            """)
+            cursor.execute("""
+                UPDATE clips
+                SET processed_video_path = REPLACE(processed_video_path, 'MoneyPrinterTurbo', 'AutoShortsStudio')
+                WHERE processed_video_path LIKE '%MoneyPrinterTurbo%'
+            """)
+            cursor.execute("""
+                UPDATE clips
+                SET subtitle_path = REPLACE(subtitle_path, 'MoneyPrinterTurbo', 'AutoShortsStudio')
+                WHERE subtitle_path LIKE '%MoneyPrinterTurbo%'
+            """)
+
+            # 2. Yarim kalan klipleri tespit et
+            cursor.execute("""
+                SELECT * FROM clips WHERE status IN (?, ?, ?, ?)
+            """, transient_statuses)
+            rows = cursor.fetchall()
+
+            for r in rows:
+                clip_id = r["clip_id"]
+                raw_p = r["raw_video_path"] or ""
+                proc_p = r["processed_video_path"] or ""
+
+                if proc_p and os.path.exists(proc_p) and os.path.getsize(proc_p) > 10240:
+                    new_status = ClipStatus.READY.value
+                    stats["recovered_ready"] += 1
+                elif raw_p and os.path.exists(raw_p) and os.path.getsize(raw_p) > 10240:
+                    new_status = ClipStatus.DOWNLOADED.value
+                    stats["recovered_downloaded"] += 1
+                else:
+                    new_status = ClipStatus.DISCOVERED.value
+                    stats["recovered_discovered"] += 1
+
+                cursor.execute("""
+                    UPDATE clips
+                    SET status = ?, error_message = NULL, updated_at = ?
+                    WHERE clip_id = ?
+                """, (new_status, datetime.utcnow().isoformat(), clip_id))
+
+            conn.commit()
+
+        if sum(stats.values()) > 0:
+            logger.info(
+                f"Recovered {sum(stats.values())} interrupted clips: "
+                f"{stats['recovered_ready']} ready, {stats['recovered_downloaded']} downloaded, "
+                f"{stats['recovered_discovered']} reset to discovered"
+            )
+        return stats
+
 
 
 # Singleton ornek

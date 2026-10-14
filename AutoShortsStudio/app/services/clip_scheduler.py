@@ -69,6 +69,18 @@ class ClipSchedulerService:
             logger.warning("Scheduler already running")
             return
 
+        # Onceki calismadan yarim kalan (downloading, editing, uploading) islemleri kurtar
+        recovery_stats = clip_db.recover_interrupted_clips()
+        total_recovered = sum(recovery_stats.values())
+        if total_recovered > 0:
+            self._add_log(
+                f"Yarim kalan {total_recovered} klip kurtarildi: "
+                f"{recovery_stats.get('recovered_ready', 0)} hazir, "
+                f"{recovery_stats.get('recovered_downloaded', 0)} indirilmis olarak devam ediyor, "
+                f"{recovery_stats.get('recovered_discovered', 0)} yeniden baslatilacak.",
+                "info"
+            )
+
         self._stop_event.clear()
         self._is_running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="ClipSchedulerThread")
@@ -110,10 +122,14 @@ class ClipSchedulerService:
             self._add_log(f"İşleniyor ({fmt_label}): '{clip.title}' ({clip.channel_name} - {clip.platform.value})", "info")
             clip_db.save_clip(clip)
 
-            # 1. Indirme (ayni kaynagin ikizleri tek dosyayi paylasir)
-            self._current_task_info = f"İndiriliyor: {clip.title[:30]}"
-            self._add_log(f"Video indiriliyor: {clip.url}", "info")
-            raw_path = clip_downloader.download_clip(clip)
+            # 1. Indirme (onceden inmis ise indirme atlanir, ayni kaynagin ikizleri tek dosyayi paylasir)
+            raw_path = clip.raw_video_path
+            if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 10240:
+                self._add_log(f"Zaten indirilmis video kullaniliyor (indirme atlandi): {os.path.basename(raw_path)}", "info")
+            else:
+                self._current_task_info = f"İndiriliyor: {clip.title[:30]}"
+                self._add_log(f"Video indiriliyor: {clip.url}", "info")
+                raw_path = clip_downloader.download_clip(clip)
 
             if clip.target_format == ClipTargetFormat.HORIZONTAL:
                 publish_target = self._process_horizontal(clip, raw_path, settings,
