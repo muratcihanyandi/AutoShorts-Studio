@@ -23,8 +23,22 @@ class ShortsPublisherService:
 
     # ================= Metadata Yardimcilari =================
 
-    def _generate_llm_metadata(self, clip: ClipItem, platform_spec: str) -> Optional[Dict[str, Any]]:
+    def _generate_llm_metadata(self, clip: ClipItem, platform_spec: str, settings: Optional[ClipPipelineSettings] = None) -> Optional[Dict[str, Any]]:
         """LLM ile viral baslik/aciklama/etiket uretir; basarisizsa None doner."""
+        try:
+            from app.services.clip_ai_seo import clip_ai_seo
+            is_shorts = (platform_spec == "youtube_shorts")
+            target_format = ClipTargetFormat.SHORTS if is_shorts else ClipTargetFormat.HORIZONTAL
+            ai_pkg = clip_ai_seo.generate_monetization_metadata(clip, target_format, settings=settings)
+            if ai_pkg and ai_pkg.get("title"):
+                return {
+                    "title": ai_pkg.get("title"),
+                    "caption": ai_pkg.get("description"),
+                    "hashtags": ai_pkg.get("tags") or []
+                }
+        except Exception as e:
+            logger.warning(f"clip_ai_seo metadata generation failed, falling back to llm.generate_social_metadata: {e}")
+
         try:
             metadata = llm.generate_social_metadata(
                 video_subject=clip.title,
@@ -58,10 +72,124 @@ class ShortsPublisherService:
         clip: ClipItem,
         settings: Optional[ClipPipelineSettings] = None
     ) -> Optional[str]:
-        """Klibin hedef formatina gore (Shorts / yatay video) YouTube'a yukler."""
+        """
+        Klibin hedef formatina gore (Shorts / yatay video) YouTube'a yukler veya
+        onceden taslak (private) olarak yuklenmisse aninda 'public' (Herkese Acik) yapar.
+        """
+        if settings is None:
+            settings = clip_db.get_settings()
+
+        # Eger video onceden YouTube'a taslak olarak yuklenmisse, yeni bir dosya upload'u yapma!
+        # Dogrudan gizliligi 'public' yap (200ms icinde yayinda).
+        target_privacy = (settings.privacy_status or "public").lower()
+        if clip.youtube_video_id and str(clip.youtube_status).lower() in ("private", "unlisted", "draft"):
+            logger.info(
+                f"[InstantPublish] '{clip.title}' zaten YouTube'da taslak yuklu (ID: {clip.youtube_video_id}). "
+                f"Gizlilik aninda '{target_privacy}' yapiliyor..."
+            )
+            update_res = youtube_uploader_service.update_video_privacy(clip.youtube_video_id, target_privacy)
+            if update_res.get("success"):
+                published_now = datetime.now()
+                clip.youtube_status = target_privacy
+                clip.status = ClipStatus.PUBLISHED
+                clip.published_at = published_now
+                clip_db.update_clip_status(
+                    clip.clip_id,
+                    ClipStatus.PUBLISHED,
+                    youtube_status=target_privacy,
+                    published_at=published_now
+                )
+                logger.success(f"[InstantPublish] Taslak video basariyla '{target_privacy}' yapildi: https://youtu.be/{clip.youtube_video_id}")
+                return clip.youtube_video_id
+            else:
+                logger.warning(f"[InstantPublish] Taslak privacy guncelleme basarisiz ({update_res.get('error')}), normal yukleme deneniyor...")
+
         if clip.target_format == ClipTargetFormat.HORIZONTAL:
             return self.publish_clip_horizontal(clip, settings=settings)
         return self.publish_clip_to_shorts(clip, settings=settings)
+
+    def pre_upload_draft(
+        self,
+        clip: ClipItem,
+        settings: Optional[ClipPipelineSettings] = None
+    ) -> Optional[str]:
+        """
+        Kurgulanmis READY videoyu YouTube'a tum metadata'si (baslik, aciklama, etiket, thumbnail)
+        ile birlikte 'private' (taslak/gizli) olarak onceden yukler.
+        Klip durumu READY olarak kalir ancak youtube_video_id ve youtube_status='private' atanir.
+        """
+        if not self.is_youtube_ready():
+            return None
+        if clip.youtube_video_id:
+            return clip.youtube_video_id
+        if not clip.processed_video_path or not os.path.exists(clip.processed_video_path):
+            return None
+
+        if settings is None:
+            settings = clip_db.get_settings()
+
+        title = clip.youtube_title or clip.title
+        is_shorts = (clip.target_format == ClipTargetFormat.SHORTS)
+        video_aspect = "9:16" if is_shorts else "16:9"
+
+        if is_shorts and "#Shorts" not in title and "#shorts" not in title:
+            title = f"{title[:85]} #Shorts"
+
+        description = clip.youtube_description or (
+            f"Klip: {clip.title}\nYayıncı: {clip.channel_name} ({clip.platform.value})\n"
+            f"Orijinal Link: {clip.url}\n\n#Shorts #Twitch #Kick #Highlights"
+        )
+        tags = clip.youtube_tags or ["Shorts", clip.channel_name or "Streamer", "Gaming"]
+        thumb_path = clip.custom_thumbnail_path
+        category_id = clip.youtube_category_id or settings.youtube_category_id or "20"
+
+        logger.info(f"[PreUploadDraft] '{clip.title}' YouTube'a taslak (private) olarak onceden yukleniyor...")
+        try:
+            paid_promo = getattr(clip, "has_paid_promotion", None)
+            if paid_promo is None:
+                paid_promo = getattr(settings, "has_paid_promotion", False)
+
+            synth_media = getattr(clip, "contains_synthetic_media", None)
+            if synth_media is None:
+                synth_media = getattr(settings, "contains_synthetic_media", False)
+
+            result = upload_to_youtube(
+                video_path=clip.processed_video_path,
+                title=title,
+                description=description,
+                tags=tags,
+                privacy_status="private",
+                video_aspect=video_aspect,
+                thumbnail_path=thumb_path,
+                category_id=category_id,
+                made_for_kids=False,
+                age_restricted=False,
+                has_paid_promotion=bool(paid_promo),
+                contains_synthetic_media=bool(synth_media),
+            )
+
+            video_id = None
+            if isinstance(result, dict) and result.get("success"):
+                video_id = result.get("video_id")
+            elif isinstance(result, str):
+                video_id = result
+
+            if video_id:
+                clip.youtube_video_id = video_id
+                clip.youtube_status = "private"
+                clip_db.update_clip_metadata(
+                    clip.clip_id,
+                    youtube_video_id=video_id,
+                    youtube_status="private",
+                    youtube_title=title,
+                    youtube_description=description,
+                    youtube_tags=tags
+                )
+                logger.success(f"[PreUploadDraft] Video basariyla taslak yuklendi! ID: {video_id} (Yayin saati geldiginde saniyesinde Herkese Acik yapilacak)")
+                return video_id
+        except Exception as e:
+            logger.warning(f"[PreUploadDraft] Taslak yukleme hatasi: {e}")
+        return None
 
     def publish_clip_to_shorts(
         self,
@@ -73,7 +201,10 @@ class ShortsPublisherService:
         Basarili olursa YouTube Video ID dondurur.
         """
         if not clip.processed_video_path or not os.path.exists(clip.processed_video_path):
-            raise FileNotFoundError(f"Processed video not found: {clip.processed_video_path}")
+            err_msg = f"Processed video not found: {clip.processed_video_path}"
+            logger.error(err_msg)
+            clip_db.update_clip_status(clip.clip_id, ClipStatus.FAILED, error_message=err_msg)
+            raise FileNotFoundError(err_msg)
 
         if settings is None:
             settings = clip_db.get_settings()
@@ -84,7 +215,7 @@ class ShortsPublisherService:
         tags = clip.youtube_tags
 
         if not title and settings.ai_title_generation:
-            metadata = self._generate_llm_metadata(clip, platform_spec="youtube_shorts")
+            metadata = self._generate_llm_metadata(clip, platform_spec="youtube_shorts", settings=settings)
             if metadata:
                 title = metadata.get("title")
                 if not description:
@@ -107,7 +238,7 @@ class ShortsPublisherService:
             tags = ["Shorts", "Twitch", "Kick", clip.channel_name, "Gaming"]
         privacy = settings.privacy_status or "private"
 
-        return self._upload(clip, title, description, tags, privacy, video_aspect="9:16")
+        return self._upload(clip, title, description, tags, privacy, video_aspect="9:16", settings=settings)
 
     def publish_clip_horizontal(
         self,
@@ -119,7 +250,10 @@ class ShortsPublisherService:
         Altyazi eklenmemis goruntuyu oldugu gibi kullanir; #Shorts etiketi kullanilmaz.
         """
         if not clip.processed_video_path or not os.path.exists(clip.processed_video_path):
-            raise FileNotFoundError(f"Processed video not found: {clip.processed_video_path}")
+            err_msg = f"Processed video not found: {clip.processed_video_path}"
+            logger.error(err_msg)
+            clip_db.update_clip_status(clip.clip_id, ClipStatus.FAILED, error_message=err_msg)
+            raise FileNotFoundError(err_msg)
 
         if settings is None:
             settings = clip_db.get_settings()
@@ -129,7 +263,7 @@ class ShortsPublisherService:
         tags = clip.youtube_tags
 
         if not title and settings.ai_title_generation:
-            metadata = self._generate_llm_metadata(clip, platform_spec="youtube_video")
+            metadata = self._generate_llm_metadata(clip, platform_spec="youtube_video", settings=settings)
             if metadata:
                 title = metadata.get("title")
                 if not description:
@@ -149,7 +283,7 @@ class ShortsPublisherService:
             tags = [clip.channel_name, clip.platform.value.title(), "Highlights", "Gaming"]
         privacy = settings.privacy_status or "private"
 
-        return self._upload(clip, title, description, tags, privacy, video_aspect="16:9")
+        return self._upload(clip, title, description, tags, privacy, video_aspect="16:9", settings=settings)
 
     def _upload(
         self,
@@ -158,18 +292,31 @@ class ShortsPublisherService:
         description: str,
         tags,
         privacy: str,
-        video_aspect: str
+        video_aspect: str,
+        settings: Optional[ClipPipelineSettings] = None
     ) -> Optional[str]:
         """Ortak YouTube yukleme ve durum guncelleme akisi."""
         from app.services.video_progress_tracker import video_progress_tracker
         from app.services.hype_detector import hype_detector
 
-        settings = clip_db.get_settings()
+        if settings is None:
+            settings = clip_db.get_settings()
+
         logger.info(
             f"Uploading clip '{clip.clip_id}' to YouTube "
             f"({clip.target_format.value}, aspect={video_aspect}, privacy={privacy})..."
         )
         clip_db.update_clip_status(clip.clip_id, ClipStatus.UPLOADING)
+
+        if not video_progress_tracker.get_active_task():
+            video_progress_tracker.start_task(
+                clip_id=clip.clip_id,
+                title=title,
+                channel_name=clip.channel_name,
+                target_format=clip.target_format.value,
+                platform=clip.platform.value,
+            )
+
         video_progress_tracker.update_stage(
             stage="uploading",
             stage_label="YouTube'a Yükleniyor (%95)",
@@ -192,7 +339,18 @@ class ShortsPublisherService:
                 logger.warning(f"Auto thumbnail generation failed: {thumb_err}")
 
         category_id = clip.youtube_category_id or settings.youtube_category_id or "20"
-        made_for_kids = clip.made_for_kids if clip.made_for_kids is not None else settings.made_for_kids
+        # Para kazanma (monetization) ve yorumlar için kesinlikle Çocuklara Özel Değil (False)
+        # ve 18+ Yaş Sınırı Devre Dışı (False)
+        made_for_kids = False
+        age_restricted = False
+
+        paid_promo = getattr(clip, "has_paid_promotion", None)
+        if paid_promo is None:
+            paid_promo = getattr(settings, "has_paid_promotion", False)
+
+        synth_media = getattr(clip, "contains_synthetic_media", None)
+        if synth_media is None:
+            synth_media = getattr(settings, "contains_synthetic_media", False)
 
         try:
             result = upload_to_youtube(
@@ -204,12 +362,18 @@ class ShortsPublisherService:
                 video_aspect=video_aspect,
                 thumbnail_path=thumb_path,
                 category_id=category_id,
-                made_for_kids=made_for_kids,
+                made_for_kids=False,
+                age_restricted=False,
+                has_paid_promotion=bool(paid_promo),
+                contains_synthetic_media=bool(synth_media),
             )
 
             # youtube_uploader ya dict dondurur ya da video_id string
             video_id = None
             if isinstance(result, dict):
+                if result.get("success") is False or result.get("error"):
+                    err_msg = result.get("error", "YouTube yükleme başarısız.")
+                    raise RuntimeError(f"YouTube yükleme hatası: {err_msg}")
                 video_id = result.get("id") or result.get("video_id")
             elif isinstance(result, str):
                 video_id = result

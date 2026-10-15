@@ -21,6 +21,7 @@ _CLIPS_UPDATE_COLUMNS = {
     "youtube_status", "published_at", "target_format", "source_kind", "source_key",
     "error_message", "scheduled_publish_time", "custom_thumbnail_path",
     "youtube_category_id", "made_for_kids", "age_restricted",
+    "has_paid_promotion", "contains_synthetic_media",
 }
 
 
@@ -129,8 +130,10 @@ class ClipDatabase:
             "scheduled_publish_time": "ALTER TABLE clips ADD COLUMN scheduled_publish_time TEXT",
             "custom_thumbnail_path": "ALTER TABLE clips ADD COLUMN custom_thumbnail_path TEXT",
             "youtube_category_id": "ALTER TABLE clips ADD COLUMN youtube_category_id TEXT",
-            "made_for_kids": "ALTER TABLE clips ADD COLUMN made_for_kids INTEGER DEFAULT 0",
-            "age_restricted": "ALTER TABLE clips ADD COLUMN age_restricted INTEGER DEFAULT 0",
+            "made_for_kids": "ALTER TABLE clips ADD COLUMN made_for_kids INTEGER",
+            "age_restricted": "ALTER TABLE clips ADD COLUMN age_restricted INTEGER",
+            "has_paid_promotion": "ALTER TABLE clips ADD COLUMN has_paid_promotion INTEGER DEFAULT 0",
+            "contains_synthetic_media": "ALTER TABLE clips ADD COLUMN contains_synthetic_media INTEGER DEFAULT 0",
         }
         for col, sql in clips_migration.items():
             if col not in clips_cols:
@@ -275,8 +278,9 @@ class ClipDatabase:
                     hype_score, viral_score, hook_text, cut_start_sec, cut_end_sec, priority,
                     youtube_title, youtube_description, youtube_tags, youtube_video_id,
                     youtube_status, youtube_category_id, made_for_kids, age_restricted,
+                    has_paid_promotion, contains_synthetic_media,
                     custom_thumbnail_path, scheduled_publish_time, published_at, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 clip.clip_id,
                 clip.platform.value,
@@ -307,8 +311,10 @@ class ClipDatabase:
                 clip.youtube_video_id,
                 clip.youtube_status,
                 clip.youtube_category_id,
-                1 if clip.made_for_kids else 0,
-                1 if clip.age_restricted else 0,
+                None if clip.made_for_kids is None else (1 if clip.made_for_kids else 0),
+                None if clip.age_restricted is None else (1 if clip.age_restricted else 0),
+                None if clip.has_paid_promotion is None else (1 if clip.has_paid_promotion else 0),
+                None if clip.contains_synthetic_media is None else (1 if clip.contains_synthetic_media else 0),
                 clip.custom_thumbnail_path,
                 sched_str,
                 published_at_str,
@@ -341,6 +347,13 @@ class ClipDatabase:
             sql = f"UPDATE clips SET {', '.join(updates)} WHERE clip_id = ?"
             cursor.execute(sql, params)
             conn.commit()
+
+            if status == ClipStatus.READY:
+                try:
+                    from app.services.video_progress_tracker import video_progress_tracker
+                    video_progress_tracker._change_counter += 1
+                except Exception:
+                    pass
 
     def list_clips(
         self,
@@ -394,7 +407,23 @@ class ClipDatabase:
             """, (ClipStatus.PUBLISHED.value, target_format))
             return int(cursor.fetchone()["cnt"])
 
-    def next_discovered_clip(self, target_format: str) -> Optional[ClipItem]:
+    def count_published_between(self, target_format: str, start_iso: str, end_iso: str) -> int:
+        """Belirtilen zaman araliginda yayinlanmis klip sayisi (SQLite datetime uyumlu)."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) AS cnt FROM clips
+                WHERE status = ? AND target_format = ?
+                  AND datetime(published_at) >= datetime(?)
+                  AND datetime(published_at) <= datetime(?)
+            """, (ClipStatus.PUBLISHED.value, target_format, start_iso, end_iso))
+            return int(cursor.fetchone()["cnt"])
+
+    def next_discovered_clip(
+        self,
+        target_format: str,
+        settings: Optional[ClipPipelineSettings] = None
+    ) -> Optional[ClipItem]:
         """Stokta islenmeyi bekleyen bir sonraki klip (onceden indirilmisler oncelikli, sonra populerlik)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -402,10 +431,152 @@ class ClipDatabase:
                 SELECT * FROM clips
                 WHERE status IN (?, ?) AND target_format = ?
                 ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, view_count DESC, id ASC
-                LIMIT 1
+                LIMIT 25
             """, (ClipStatus.DOWNLOADED.value, ClipStatus.DISCOVERED.value, target_format, ClipStatus.DOWNLOADED.value))
-            r = cursor.fetchone()
-            return self._row_to_clip(r) if r else None
+            rows = cursor.fetchall()
+            if not rows:
+                return None
+
+            for r in rows:
+                clip = self._row_to_clip(r)
+                if not clip:
+                    continue
+
+                # Viral video avi kapaliysa eski videolari ele ve SKIPPED olarak isaretle (DOWNLOADED olanlar dahil)
+                if settings and not settings.enable_viral_hunter:
+                    dt = None
+                    if clip.created_at_platform:
+                        clean_str = clip.created_at_platform.strip()
+                        for fmt in (
+                            "%Y-%m-%dT%H:%M:%S.%fZ",
+                            "%Y-%m-%dT%H:%M:%SZ",
+                            "%Y-%m-%dT%H:%M:%S",
+                            "%Y-%m-%d %H:%M:%S",
+                            "%Y-%m-%d",
+                            "%Y%m%d"
+                        ):
+                            try:
+                                dt = datetime.strptime(clean_str[:19], fmt[:len(clean_str[:19])])
+                                break
+                            except Exception:
+                                pass
+                    else:
+                        # Tarih yoksa (flat playlist bos donmusse), supheli videonun tarihini hizlica sorgula
+                        try:
+                            from app.services.clip_downloader import clip_downloader
+                            target_ref = clip.url or clip.clip_id
+                            dt = clip_downloader.fetch_video_upload_date(target_ref)
+                            if dt:
+                                self.update_clip_metadata(clip.clip_id, created_at_platform=dt.isoformat())
+                        except Exception:
+                            pass
+
+                    if dt:
+                        age_days = (datetime.utcnow() - dt).total_seconds() / 86400.0
+                        if age_days > settings.max_video_age_days:
+                            logger.info(
+                                f"Skipping stale discovered clip '{clip.title[:30]}' "
+                                f"({age_days:.1f}d > limit {settings.max_video_age_days}d, viral_hunter=False)"
+                            )
+                            self.update_clip_status(
+                                clip.clip_id,
+                                ClipStatus.SKIPPED,
+                                error_message=f"Eski video elendi ({age_days:.0f} günlük, limit: {settings.max_video_age_days} gün)"
+                            )
+                            continue
+                    else:
+                        # Tarih teyit edilemedi ve izlenme >= 25.000 (300k-500k eski videolar gibi)
+                        if clip.view_count >= 25000:
+                            logger.info(
+                                f"Skipping unverified high-view clip '{clip.title[:30]}' "
+                                f"(views={clip.view_count:,}, viral_hunter=False)"
+                            )
+                            self.update_clip_status(
+                                clip.clip_id,
+                                ClipStatus.SKIPPED,
+                                error_message="Tarih teyit edilemeyen yüksek izlenmeli şüpheli video atlandı."
+                            )
+                            continue
+
+                return clip
+
+            return None
+
+    def clean_stale_discovered_clips(
+        self,
+        max_age_days: int = 7,
+        enable_viral_hunter: bool = False,
+        viral_threshold: int = 50000
+    ) -> int:
+        """
+        Eski veya uygunsuz DISCOVERED klipleri SKIPPED durumuna alir.
+        Viral video avi kapaliysa max_age_days'den eski tum kesif klipleri elenir.
+        Tarihsiz ve yuksek izlenmeli supheli videolar da atlanir.
+        """
+        cleaned = 0
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM clips WHERE status = ?
+            """, (ClipStatus.DISCOVERED.value,))
+            rows = cursor.fetchall()
+
+            for r in rows:
+                clip = self._row_to_clip(r)
+                if not clip:
+                    continue
+
+                is_stale = False
+                age_days = 0.0
+
+                if clip.created_at_platform:
+                    clean_str = clip.created_at_platform.strip()
+                    dt = None
+                    for fmt in (
+                        "%Y-%m-%dT%H:%M:%S.%fZ",
+                        "%Y-%m-%dT%H:%M:%SZ",
+                        "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%d %H:%M:%S",
+                        "%Y-%m-%d",
+                        "%Y%m%d"
+                    ):
+                        try:
+                            dt = datetime.strptime(clean_str[:19], fmt[:len(clean_str[:19])])
+                            break
+                        except Exception:
+                            pass
+                    if dt:
+                        age_days = (datetime.utcnow() - dt).total_seconds() / 86400.0
+                        if age_days > max_age_days:
+                            if not (enable_viral_hunter and clip.view_count >= viral_threshold):
+                                is_stale = True
+
+                else:
+                    # Tarihsiz video kontrolu: Viral avi kapaliyken yuksek izlenmeli tarihsiz videolar temizlenir
+                    if not enable_viral_hunter and clip.view_count >= 15000:
+                        is_stale = True
+                        age_days = 999.0
+                    elif clip.created_at:
+                        db_age = (datetime.utcnow() - clip.created_at).total_seconds() / 86400.0
+                        if db_age > max_age_days and not enable_viral_hunter:
+                            is_stale = True
+                            age_days = db_age
+
+                if is_stale:
+                    cursor.execute("""
+                        UPDATE clips SET status = ?, error_message = ?, updated_at = ?
+                        WHERE clip_id = ?
+                    """, (
+                        ClipStatus.SKIPPED.value,
+                        f"Temizlendi: Eski/teyitsiz video (Limit: {max_age_days} gün)",
+                        datetime.utcnow().isoformat(),
+                        clip.clip_id
+                    ))
+                    cleaned += 1
+
+            conn.commit()
+        logger.info(f"clean_stale_discovered_clips: {cleaned} stale clips marked as SKIPPED")
+        return cleaned
 
     def next_ready_clip(self, target_format: str) -> Optional[ClipItem]:
         """Yayinlanmayi bekleyen en uygun READY klip (oncelik > viral_score > hype > eskilik)."""
@@ -483,8 +654,13 @@ class ClipDatabase:
                     v = json.dumps(v)
                 elif k == "scheduled_publish_time" and isinstance(v, datetime):
                     v = v.isoformat()
-                elif k in ("made_for_kids", "age_restricted") and isinstance(v, bool):
-                    v = 1 if v else 0
+                elif k in ("made_for_kids", "age_restricted", "has_paid_promotion", "contains_synthetic_media"):
+                    if v is None:
+                        v = None
+                    elif isinstance(v, bool):
+                        v = 1 if v else 0
+                    elif isinstance(v, (int, float)):
+                        v = 1 if v else 0
                 updates.append(f"{k} = ?")
                 params.append(v)
             params.append(clip_id)
@@ -494,13 +670,27 @@ class ClipDatabase:
     def delete_clip(self, clip_id: str) -> bool:
         clip = self.get_clip_by_id(clip_id)
         if clip:
-            for file_path in [clip.raw_video_path, clip.processed_video_path, clip.subtitle_path]:
+            # S19: raw_video_path ikiz klip tarafindan kullaniliyorsa silinmemeli
+            skip_raw = False
+            if clip.source_key and clip.raw_video_path:
+                if self.source_siblings_pending(clip.source_key, clip_id):
+                    skip_raw = True
+                    logger.info(f"Preserving raw file {clip.raw_video_path} because siblings are still pending")
+
+            for file_path in [clip.processed_video_path, clip.subtitle_path]:
                 if file_path and os.path.exists(file_path):
                     try:
                         os.remove(file_path)
                         logger.info(f"Deleted physical clip file: {file_path}")
                     except Exception as e:
                         logger.warning(f"Could not remove physical file {file_path}: {e}")
+
+            if not skip_raw and clip.raw_video_path and os.path.exists(clip.raw_video_path):
+                try:
+                    os.remove(clip.raw_video_path)
+                    logger.info(f"Deleted physical raw file: {clip.raw_video_path}")
+                except Exception as e:
+                    logger.warning(f"Could not remove physical raw file {clip.raw_video_path}: {e}")
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -580,8 +770,10 @@ class ClipDatabase:
             youtube_video_id=r["youtube_video_id"],
             youtube_status=r["youtube_status"],
             youtube_category_id=r["youtube_category_id"] if "youtube_category_id" in r.keys() else None,
-            made_for_kids=bool(r["made_for_kids"]) if "made_for_kids" in r.keys() and r["made_for_kids"] is not None else False,
-            age_restricted=bool(r["age_restricted"]) if "age_restricted" in r.keys() and r["age_restricted"] is not None else False,
+            made_for_kids=bool(r["made_for_kids"]) if ("made_for_kids" in r.keys() and r["made_for_kids"] is not None) else False,
+            age_restricted=bool(r["age_restricted"]) if ("age_restricted" in r.keys() and r["age_restricted"] is not None) else False,
+            has_paid_promotion=bool(r["has_paid_promotion"]) if ("has_paid_promotion" in r.keys() and r["has_paid_promotion"] is not None) else False,
+            contains_synthetic_media=bool(r["contains_synthetic_media"]) if ("contains_synthetic_media" in r.keys() and r["contains_synthetic_media"] is not None) else False,
             custom_thumbnail_path=r["custom_thumbnail_path"] if "custom_thumbnail_path" in r.keys() else None,
             scheduled_publish_time=datetime.fromisoformat(r["scheduled_publish_time"]) if "scheduled_publish_time" in r.keys() and r["scheduled_publish_time"] else None,
             published_at=datetime.fromisoformat(r["published_at"]) if r["published_at"] else None,
@@ -633,24 +825,51 @@ class ClipDatabase:
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # 1. Eski yol referanslarini normalize et
+            # 1. Eski yol referanslarini normalize et (AutoShortsStudioNEW -> MoneyPrinterTurboNEW)
             cursor.execute("""
                 UPDATE clips
-                SET raw_video_path = REPLACE(raw_video_path, 'MoneyPrinterTurbo', 'AutoShortsStudio')
-                WHERE raw_video_path LIKE '%MoneyPrinterTurbo%'
+                SET raw_video_path = REPLACE(raw_video_path, 'AutoShortsStudioNEW', 'MoneyPrinterTurboNEW'),
+                    processed_video_path = REPLACE(processed_video_path, 'AutoShortsStudioNEW', 'MoneyPrinterTurboNEW'),
+                    subtitle_path = REPLACE(subtitle_path, 'AutoShortsStudioNEW', 'MoneyPrinterTurboNEW'),
+                    custom_thumbnail_path = REPLACE(custom_thumbnail_path, 'AutoShortsStudioNEW', 'MoneyPrinterTurboNEW')
+                WHERE raw_video_path LIKE '%AutoShortsStudioNEW%'
+                   OR processed_video_path LIKE '%AutoShortsStudioNEW%'
+                   OR subtitle_path LIKE '%AutoShortsStudioNEW%'
+                   OR custom_thumbnail_path LIKE '%AutoShortsStudioNEW%'
             """)
             cursor.execute("""
                 UPDATE clips
-                SET processed_video_path = REPLACE(processed_video_path, 'MoneyPrinterTurbo', 'AutoShortsStudio')
-                WHERE processed_video_path LIKE '%MoneyPrinterTurbo%'
-            """)
-            cursor.execute("""
-                UPDATE clips
-                SET subtitle_path = REPLACE(subtitle_path, 'MoneyPrinterTurbo', 'AutoShortsStudio')
-                WHERE subtitle_path LIKE '%MoneyPrinterTurbo%'
+                SET raw_video_path = REPLACE(raw_video_path, 'MoneyPrinterTurbo\\storage', 'AutoShortsStudio\\storage'),
+                    processed_video_path = REPLACE(processed_video_path, 'MoneyPrinterTurbo\\storage', 'AutoShortsStudio\\storage'),
+                    subtitle_path = REPLACE(subtitle_path, 'MoneyPrinterTurbo\\storage', 'AutoShortsStudio\\storage'),
+                    custom_thumbnail_path = REPLACE(custom_thumbnail_path, 'MoneyPrinterTurbo\\storage', 'AutoShortsStudio\\storage')
+                WHERE raw_video_path LIKE '%MoneyPrinterTurbo\\storage%'
+                   OR processed_video_path LIKE '%MoneyPrinterTurbo\\storage%'
+                   OR subtitle_path LIKE '%MoneyPrinterTurbo\\storage%'
+                   OR custom_thumbnail_path LIKE '%MoneyPrinterTurbo\\storage%'
             """)
 
-            # 2. Yarim kalan klipleri tespit et
+            # 2. READY durumundaki kliplerin dosya yollarini ve mevcudiyetini dogrula (S3 ve S4 onlemi)
+            from app.utils import utils
+            ready_dir = os.path.join(utils.root_dir(), "storage", "clips", "ready")
+            cursor.execute("SELECT clip_id, processed_video_path FROM clips WHERE status = ?", (ClipStatus.READY.value,))
+            ready_rows = cursor.fetchall()
+            for r in ready_rows:
+                cid = r["clip_id"]
+                proc_p = r["processed_video_path"] or ""
+                if not (proc_p and os.path.exists(proc_p) and os.path.getsize(proc_p) > 1024):
+                    basename = os.path.basename(proc_p) if proc_p else ""
+                    candidate = os.path.join(ready_dir, basename) if basename else ""
+                    if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 1024:
+                        cursor.execute("UPDATE clips SET processed_video_path = ?, updated_at = ? WHERE clip_id = ?",
+                                       (candidate, datetime.utcnow().isoformat(), cid))
+                        logger.info(f"[DB Recover] Onarildi: READY klip {cid} -> {candidate}")
+                    else:
+                        cursor.execute("UPDATE clips SET status = ?, error_message = ?, updated_at = ? WHERE clip_id = ?",
+                                       (ClipStatus.FAILED.value, "Dosya diskte bulunamadi (otomatik FAILED)", datetime.utcnow().isoformat(), cid))
+                        logger.warning(f"[DB Recover] READY klip {cid} dosyasi bulunamadi, kilitlenmeyi onlemek icin FAILED yapildi")
+
+            # 3. Yarim kalan klipleri tespit et
             cursor.execute("""
                 SELECT * FROM clips WHERE status IN (?, ?, ?, ?)
             """, transient_statuses)
@@ -676,6 +895,18 @@ class ClipDatabase:
                     SET status = ?, error_message = NULL, updated_at = ?
                     WHERE clip_id = ?
                 """, (new_status, datetime.utcnow().isoformat(), clip_id))
+
+            # K3 onlemi: Ozel olarak ayarlanmamis kliplerdeki eski 0 degerlerini NULL yap ki ayar fallback'i calissin
+            cursor.execute("""
+                UPDATE clips
+                SET made_for_kids = NULL
+                WHERE made_for_kids = 0 AND (youtube_title IS NULL OR youtube_title = '')
+            """)
+            cursor.execute("""
+                UPDATE clips
+                SET age_restricted = NULL
+                WHERE age_restricted = 0 AND (youtube_title IS NULL OR youtube_title = '')
+            """)
 
             conn.commit()
 

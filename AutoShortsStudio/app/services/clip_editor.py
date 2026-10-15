@@ -1,8 +1,17 @@
 import os
 import math
 import subprocess
+import uuid
 from typing import Optional, List
 from loguru import logger
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+
+try:
+    import cv2
+    _OPENCV_AVAILABLE = True
+except ImportError:
+    _OPENCV_AVAILABLE = False
 
 from app.utils import utils
 from app.config import config
@@ -10,6 +19,8 @@ from app.models.clip_schema import (
     ClipItem, ClipPipelineSettings, ClipStatus, ClipTargetFormat, ClipSourceKind
 )
 from app.services.clip_db import clip_db
+from app.services.hardware_detector import hardware_detector
+from app.services.video_progress_tracker import video_progress_tracker
 
 try:
     from faster_whisper import WhisperModel
@@ -36,6 +47,11 @@ class ClipEditorService:
         if not os.path.exists(ffmpeg_bin):
             ffmpeg_bin = "ffmpeg"
         self.ffmpeg_bin = ffmpeg_bin
+
+        ffprobe_bin = os.path.join(base_dir, "lib", "ffmpeg", "ffmpeg-7.0-essentials_build", "ffprobe.exe")
+        if not os.path.exists(ffprobe_bin):
+            ffprobe_bin = "ffprobe"
+        self.ffprobe_bin = ffprobe_bin
 
         self.ready_dir = os.path.join(utils.root_dir(), "storage", "clips", "ready")
         self.temp_dir = os.path.join(utils.root_dir(), "storage", "clips", "temp")
@@ -89,11 +105,345 @@ class ClipEditorService:
         res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         return res.returncode == 0 and os.path.exists(out_audio_path)
 
+    def probe_video_properties(self, video_path: str) -> dict:
+        """
+        ffprobe ile video cozunurlugu, en-boy orani ve altyazi akislarini sorgular.
+        """
+        result = {
+            "width": 1920,
+            "height": 1080,
+            "is_vertical": False,
+            "duration": 0.0,
+            "has_subtitle_stream": False
+        }
+        if not video_path or not os.path.exists(video_path):
+            return result
+
+        try:
+            cmd = [
+                self.ffprobe_bin,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,duration",
+                "-of", "csv=s=x:p=0",
+                video_path
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=15)
+            line = res.stdout.strip().split("\n")[0] if res.stdout.strip() else ""
+            parts = line.split("x")
+            if len(parts) >= 2:
+                w = int(parts[0])
+                h = int(parts[1])
+                result["width"] = w
+                result["height"] = h
+                result["is_vertical"] = (h > w)
+        except Exception as e:
+            logger.warning(f"Failed to probe video dimensions: {e}")
+
+        try:
+            sub_cmd = [
+                self.ffprobe_bin,
+                "-v", "error",
+                "-select_streams", "s",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                video_path
+            ]
+            sub_res = subprocess.run(sub_cmd, capture_output=True, text=True, errors="replace", timeout=15)
+            if sub_res.stdout.strip():
+                result["has_subtitle_stream"] = True
+        except Exception:
+            pass
+
+        return result
+
+    def check_video_has_subtitles(self, video_path: str) -> bool:
+        """
+        Videoda gomulu veya ekrana basilmis (hardcoded) altyazi olup olmadigini tespit eder.
+        1. ffprobe ile soft subtitle akisi kontrolu
+        2. Ornek kareler cikarilarak alt bolgede (lower-third) yuksek kontrastli altyazi pikselleri tespiti
+        """
+        props = self.probe_video_properties(video_path)
+        if props.get("has_subtitle_stream"):
+            return True
+
+        # Video karesi cikarip metin/altyazi bolgesini incele
+        try:
+            from PIL import Image
+            import numpy as np
+
+            # 2. ve 5. saniyelerden 2 ornek kare al
+            sample_times = [2.0, 5.0]
+            detected_samples = 0
+
+            for sec in sample_times:
+                tmp_frame = os.path.join(self.temp_dir, f"sub_chk_{os.getpid()}_{int(sec)}.jpg")
+                cmd = [
+                    self.ffmpeg_bin, "-y",
+                    "-ss", str(sec),
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-q:v", "3",
+                    tmp_frame
+                ]
+                subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=10)
+                if os.path.exists(tmp_frame):
+                    try:
+                        with Image.open(tmp_frame) as img:
+                            w, h = img.size
+                            # Altyazinin yerlesebilecegi alt bolge (h*0.60 ile h*0.90 arasi)
+                            crop_box = (int(w * 0.10), int(h * 0.60), int(w * 0.90), int(h * 0.90))
+                            sub_region = img.crop(crop_box).convert("L")
+                            arr = np.array(sub_region, dtype=np.float32)
+
+                            # Metin pikselleri yuksek parlaklik (>215) ve kenarlarinda koyu cerceve (<45) barindirir
+                            bright_pixels = np.sum(arr > 215)
+                            dark_pixels = np.sum(arr < 45)
+                            total_px = arr.size
+                            
+                            if total_px > 0 and (bright_pixels / total_px > 0.012) and (dark_pixels / total_px > 0.035):
+                                grad = np.abs(arr[:, 1:] - arr[:, :-1])
+                                if np.mean(grad) > 16.0:
+                                    detected_samples += 1
+                    finally:
+                        if os.path.exists(tmp_frame):
+                            try:
+                                os.remove(tmp_frame)
+                            except Exception:
+                                pass
+
+            if detected_samples >= 1:
+                logger.info(f"Existing subtitles detected in '{video_path}' via visual check.")
+                return True
+
+        except Exception as e:
+            logger.debug(f"Subtitle visual check skipped: {e}")
+
+        return False
+
+    def detect_facecam_position(
+        self,
+        video_path: str,
+        sample_fractions: tuple[float, ...] = (0.15, 0.35, 0.55, 0.75)
+    ) -> str:
+        """
+        Videodaki yayıncı webcamini (facecam) bilgisayarlı görü, zamansal hareket (temporal motion)
+        ve yüz analizi ile otomatik tespit eder.
+        
+        Özellikler:
+        1. İki ardışık zaman karesi (t1, t2) arasındaki piksel farkı ile hareket analizi yapar.
+        2. MSI, Asus, bağış barı gibi tamamen STATİK olan sponsor logolarını sıfır hareketten tespit edip eler.
+        3. OpenCV Haar Cascade ile bulunan yüzün canlılığını (hareket ve en/boy oranını) doğrular.
+        4. Cilt tonu (Skin Color) analizinde doygun kırmızı (saturated red) logo piksellerini filtreler.
+        """
+        if not video_path or not os.path.exists(video_path):
+            return "bottom_left"
+
+        props = self.probe_video_properties(video_path)
+        duration = float(props.get("duration", 0.0) or 0.0)
+
+        sample_times = []
+        if duration > 3.0:
+            for frac in sample_fractions:
+                t = duration * frac
+                if 1.0 <= t <= max(1.0, duration - 1.2):
+                    sample_times.append(t)
+        if not sample_times:
+            sample_times = [1.5, 3.5]
+
+        votes = {
+            "bottom_left": 0.0,
+            "bottom_right": 0.0,
+            "top_left": 0.0,
+            "top_right": 0.0,
+        }
+
+        face_cascade = None
+        if _OPENCV_AVAILABLE:
+            try:
+                cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                face_cascade = cv2.CascadeClassifier(cascade_path)
+                if face_cascade.empty():
+                    face_cascade = None
+            except Exception as e:
+                logger.debug(f"OpenCV cascade classifier init failed: {e}")
+                face_cascade = None
+
+        for t in sample_times:
+            t2 = min(duration - 0.2, t + 0.5) if duration > 2.0 else t + 0.3
+            f1_path = os.path.join(self.temp_dir, f"face_m1_{uuid.uuid4().hex[:8]}.jpg")
+            f2_path = os.path.join(self.temp_dir, f"face_m2_{uuid.uuid4().hex[:8]}.jpg")
+
+            try:
+                # 1. Kareyi çıkar (t1)
+                cmd1 = [
+                    self.ffmpeg_bin, "-y",
+                    "-ss", f"{t:.2f}",
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-q:v", "3",
+                    f1_path
+                ]
+                subprocess.run(cmd1, capture_output=True, timeout=8)
+
+                # 2. Kareyi çıkar (t2 - hareket analizi için)
+                cmd2 = [
+                    self.ffmpeg_bin, "-y",
+                    "-ss", f"{t2:.2f}",
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-q:v", "3",
+                    f2_path
+                ]
+                subprocess.run(cmd2, capture_output=True, timeout=8)
+
+                if not os.path.exists(f1_path):
+                    continue
+
+                img1 = cv2.imread(f1_path) if _OPENCV_AVAILABLE else None
+                img2 = cv2.imread(f2_path) if (_OPENCV_AVAILABLE and os.path.exists(f2_path)) else None
+
+                if img1 is None:
+                    continue
+
+                h_f, w_f = img1.shape[:2]
+                gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+                gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2 is not None else gray1
+
+                w_crop = int(w_f * 0.38)
+                h_crop = int(h_f * 0.45)
+
+                corner_boxes = {
+                    "top_left": (0, h_crop, 0, w_crop),
+                    "top_right": (0, h_crop, w_f - w_crop, w_f),
+                    "bottom_left": (h_f - h_crop, h_f, 0, w_crop),
+                    "bottom_right": (h_f - h_crop, h_f, w_f - w_crop, w_f),
+                }
+
+                # 1. Aşama: Köşeler Arası Zamansal Hareket (Temporal Motion) Analizi
+                motion_scores = {}
+                for c_name, (y1, y2, x1, x2) in corner_boxes.items():
+                    diff = cv2.absdiff(gray1[y1:y2, x1:x2], gray2[y1:y2, x1:x2])
+                    m_val = float(np.mean(diff))
+                    motion_scores[c_name] = m_val
+
+                # 2. Aşama: OpenCV Haar Cascade Yüz Tespiti + Canlılık Doğrulaması
+                face_found_in_frame = False
+                if face_cascade is not None:
+                    try:
+                        faces = face_cascade.detectMultiScale(
+                            gray1,
+                            scaleFactor=1.1,
+                            minNeighbors=5,
+                            minSize=(int(h_f * 0.08), int(h_f * 0.08)),
+                            maxSize=(int(h_f * 0.45), int(h_f * 0.45))
+                        )
+                        for (fx, fy, fw, fh) in faces:
+                            # İnsan yüzü aspect ratio kontrolü (0.70 - 1.35 arası)
+                            aspect = float(fw) / max(1.0, float(fh))
+                            if aspect < 0.70 or aspect > 1.35:
+                                continue
+
+                            cx = fx + (fw / 2.0)
+                            cy = fy + (fh / 2.0)
+                            is_left = cx < (w_f * 0.5)
+                            is_top = cy < (h_f * 0.5)
+
+                            if is_left and not is_top:
+                                corner = "bottom_left"
+                            elif not is_left and not is_top:
+                                corner = "bottom_right"
+                            elif is_left and is_top:
+                                corner = "top_left"
+                            else:
+                                corner = "top_right"
+
+                            # Yüz bölgesindeki anlık hareket kontrolü (statik logoları ele)
+                            face_diff = cv2.absdiff(
+                                gray1[fy:fy+fh, fx:fx+fw],
+                                gray2[fy:fy+fh, fx:fx+fw]
+                            )
+                            face_motion = float(np.mean(face_diff))
+                            
+                            # Eğer yüz bölgesinde hareket çok düşükse (< 1.6), bu sabit bir logodur (örn: MSI ejderhası)
+                            if face_motion < 1.6 and motion_scores.get(corner, 0.0) < 2.0:
+                                logger.info(f"[Facecam AI] Statik logo yüz sanıldı ve elendi ({corner}, hareket={face_motion:.2f})")
+                                continue
+
+                            weight = float(fw * fh) / float(w_f * h_f) * 1500.0
+                            # Hareket çarpanı: Canlı konuşan/hareket eden yüze ekstra güven puanı
+                            weight *= (1.0 + min(face_motion, 15.0) / 10.0)
+
+                            dist_to_corner_x = min(cx, w_f - cx) / w_f
+                            dist_to_corner_y = min(cy, h_f - cy) / h_f
+                            if dist_to_corner_x < 0.35 and dist_to_corner_y < 0.40:
+                                weight *= 2.0
+
+                            votes[corner] += weight
+                            face_found_in_frame = True
+                    except Exception as ex_face:
+                        logger.debug(f"Face cascade detection error on frame {t}: {ex_face}")
+
+                # 3. Aşama: Cilt Tonu (Skin Color) & Doygun Renk (Logo) Elemesi
+                if not face_found_in_frame:
+                    for c_name, (y1, y2, x1, x2) in corner_boxes.items():
+                        m_val = motion_scores.get(c_name, 0.0)
+                        # STATİK KÖŞE ELEMESİ: Hareket < 2.2 ise kesinlikle yayıncı kamerası değil, logodur!
+                        if m_val < 2.2:
+                            continue
+
+                        c_arr = img1[y1:y2, x1:x2]
+                        if c_arr.size == 0:
+                            continue
+
+                        try:
+                            # Cilt tonu tespiti
+                            ycbcr = cv2.cvtColor(c_arr, cv2.COLOR_BGR2YCrCb)
+                            cr = ycbcr[:, :, 1]
+                            cb = ycbcr[:, :, 2]
+                            skin_mask = (cb >= 77) & (cb <= 127) & (cr >= 133) & (cr <= 173)
+
+                            # MSI / Sponsor logo koruması: Doygun parlak kırmızı pikselleri kesinlikle çıkar
+                            r = c_arr[:, :, 2].astype(int)
+                            g = c_arr[:, :, 1].astype(int)
+                            b = c_arr[:, :, 0].astype(int)
+                            saturated_red = (r > 150) & (g < 80) & (b < 80)
+                            skin_mask = skin_mask & (~saturated_red)
+
+                            skin_ratio = float(np.sum(skin_mask)) / float(c_arr.shape[0] * c_arr.shape[1])
+                            if skin_ratio > 0.04:
+                                # Yalnızca hareketli olan bölgeye cilt puanı ver
+                                motion_factor = min(m_val / 3.0, 2.5)
+                                votes[c_name] += (skin_ratio * 35.0 * motion_factor)
+                        except Exception as ex_skin:
+                            logger.debug(f"Skin analysis error on {c_name}: {ex_skin}")
+
+            finally:
+                for tmp_p in (f1_path, f2_path):
+                    if os.path.exists(tmp_p):
+                        try:
+                            os.remove(tmp_p)
+                        except Exception:
+                            pass
+
+        best_corner = max(votes, key=votes.get)
+        if votes[best_corner] <= 0.0:
+            # Fallback: En yaygın webcam konumu sol-alttır
+            best_corner = "bottom_left"
+
+        logger.info(
+            f"Auto Facecam: '{os.path.basename(video_path)}' için webcam konumu "
+            f"'{best_corner}' olarak otomatik tespit edildi (Oylar: {votes})"
+        )
+        return best_corner
+
     def generate_animated_ass_subtitles(
         self,
         audio_path: str,
         out_ass_path: str,
-        highlight_color: str = "#FFD700"
+        highlight_color: str = "#FFD700",
+        font_name: str = "Arial",
+        font_size: int = 58
     ) -> Optional[str]:
         """
         faster-whisper ile kelime bazli zaman damgalari cikarir ve
@@ -117,9 +467,11 @@ class ClipEditorService:
 
         highlight_ass = _hex_to_ass_color(highlight_color)
         white_ass = "&H00FFFFFF"
+        fn = font_name or "Arial"
+        fs = font_size or 58
 
         # ASS Altyazi Dosyasi Basligi (9:16 - 1080x1920 cozunurluk)
-        # Font: Arial / Microsoft YaHei, vurgu rengi sarimsi altin, kalin siyah outline
+        # Font: Kullanici fontu, vurgu rengi sarimsi altin, kalin siyah outline
         ass_content = [
             "[Script Info]",
             "ScriptType: v4.00+",
@@ -129,8 +481,8 @@ class ClipEditorService:
             "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            # Alignment=2 (Alt Orta), MarginV=450 (Shorts dugmelerinin ustunde guvenli bolge), Fontsize=58
-            "Style: Default,Arial,58,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,80,80,450,1",
+            # Alignment=2 (Alt Orta), MarginV=450 (Shorts dugmelerinin ustunde guvenli bolge)
+            f"Style: Default,{fn},{fs},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,80,80,450,1",
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
@@ -286,6 +638,17 @@ class ClipEditorService:
             logger.warning(f"Failed to generate hook overlay image: {e}")
             return None
 
+    def _get_encoder_args(self) -> tuple[list[str], str]:
+        """
+        Sistemdeki donanıma ve kullanıcı tercihine göre uygun video encoder argümanlarını döner.
+        GPU (NVIDIA NVENC) veya CPU (libx264).
+        """
+        hw_mode = config.app.get("hardware_mode", "auto")
+        effective_codec = hardware_detector.get_effective_codec(hw_mode)
+        if effective_codec == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"], "h264_nvenc"
+        return ["-c:v", "libx264", "-preset", "fast", "-crf", "22"], "libx264"
+
     # ================= Shorts (9:16) Kurgusu =================
 
     def process_clip_to_shorts(
@@ -313,6 +676,16 @@ class ClipEditorService:
         temp_ass_path = os.path.join(self.temp_dir, f"{clip.clip_id}_sub.ass")
         temp_hook_path = os.path.join(self.temp_dir, f"{clip.clip_id}_hook.png")
 
+        # 0. Video Boyutu ve Mevcut Altyazı Tespiti
+        props = self.probe_video_properties(clip.raw_video_path)
+        is_native_vertical = props.get("is_vertical", False)
+        clip.is_vertical = is_native_vertical
+
+        already_has_subtitles = props.get("has_subtitle_stream", False)
+        if not already_has_subtitles and settings.skip_subtitles_if_detected:
+            already_has_subtitles = self.check_video_has_subtitles(clip.raw_video_path)
+        clip.has_subtitles = already_has_subtitles
+
         # 1. Kesme parametreleri
         has_cut = cut_end_sec > cut_start_sec and (cut_end_sec - cut_start_sec) >= 5.0
         time_params = []
@@ -321,30 +694,47 @@ class ClipEditorService:
             time_params = ["-ss", str(cut_start_sec), "-t", str(duration)]
             logger.info(f"Applying cut: {cut_start_sec:.1f}s - {cut_end_sec:.1f}s (duration: {duration:.1f}s)")
 
-        # 2. Altyazi uretimi (opsiyonel)
+        # 2. Altyazi uretimi (opsiyonel & mükerrer korumalı)
         transcript_text = ""
         ass_available = False
         if settings.subtitle_enabled:
-            # Once videodan/kesitten sesi cikar
-            extract_cmd = [self.ffmpeg_bin, "-y"]
-            if has_cut:
-                extract_cmd.extend(time_params)
-            extract_cmd.extend([
-                "-i", clip.raw_video_path,
-                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                temp_audio_path
-            ])
-            subprocess.run(extract_cmd, capture_output=True, text=True, errors="replace")
-
-            if os.path.exists(temp_audio_path):
-                transcript = self.generate_animated_ass_subtitles(
-                    temp_audio_path,
-                    temp_ass_path,
-                    highlight_color=settings.subtitle_color
+            if settings.skip_subtitles_if_detected and already_has_subtitles:
+                logger.info(f"Video '{clip.title}' already has subtitles; skipping Whisper subtitle generation.")
+                video_progress_tracker.update_stage(
+                    stage="subtitles",
+                    stage_label="Mevcut Altyazı Korundu (%60)",
+                    percent=60.0,
+                    detail="Videoda mevcut altyazı tespit edildi, mükerrer altyazı basılmadan devam ediliyor."
                 )
-                if transcript and os.path.exists(temp_ass_path):
-                    transcript_text = transcript
-                    ass_available = True
+            else:
+                video_progress_tracker.update_stage(
+                    stage="subtitles",
+                    stage_label="Altyazı Üretiliyor (%60)",
+                    percent=60.0,
+                    detail="Whisper ile ses analizi ve hareketli kelime altyazıları oluşturuluyor..."
+                )
+                # Once videodan/kesitten sesi cikar
+                extract_cmd = [self.ffmpeg_bin, "-y"]
+                if has_cut:
+                    extract_cmd.extend(time_params)
+                extract_cmd.extend([
+                    "-i", clip.raw_video_path,
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                    temp_audio_path
+                ])
+                subprocess.run(extract_cmd, capture_output=True, text=True, errors="replace")
+
+                if os.path.exists(temp_audio_path):
+                    transcript = self.generate_animated_ass_subtitles(
+                        temp_audio_path,
+                        temp_ass_path,
+                        highlight_color=settings.subtitle_color,
+                        font_name=settings.subtitle_font,
+                        font_size=settings.subtitle_font_size
+                    )
+                    if transcript and os.path.exists(temp_ass_path):
+                        transcript_text = transcript
+                        ass_available = True
 
         # 3. Kanca (Hook) Görseli Hazırlama (OpenShorts Hook Overlay)
         hook_available = False
@@ -357,52 +747,59 @@ class ClipEditorService:
         # 4. 9:16 Layout ve Altyazi Birlestirme Filtresi (FFmpeg Filter Complex)
         escaped_ass_path = temp_ass_path.replace("\\", "/").replace(":", "\\:")
 
-        layout = settings.video_layout or "streamer_facecam"
+        if is_native_vertical:
+            # Girdi videosu zaten dikey / Shorts!
+            # Bozulma veya yapay yarma yapmadan 1080x1920'ye tam oturt
+            layout = "native_vertical"
+            filter_str = (
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[base]"
+            )
+            final_v = "[base]"
+        else:
+            # Yatay video: Kullanıcı kuralı gereği asla yatay bırakılmaz.
+            # Yayıncının webcam'i üste, zoomlanmış oyun/ekran alta yerleştirilir.
+            layout = settings.video_layout or "streamer_facecam"
 
-        if layout == "streamer_facecam":
-            # OpenShorts Akilli Yayinci/Oyun Duzeni (Facecam + Gameplay)
-            # Uste yayinci kamerasi (1080x780), alta ana oyun/ekran (1080x1140)
-            face_x = "0"
-            face_y = "ih*0.52"
-            pos = getattr(settings, "facecam_position", "bottom_left") or "bottom_left"
-            if pos == "bottom_right":
-                face_x = "iw*0.64"
-                face_y = "ih*0.52"
-            elif pos == "top_left":
+            if layout == "streamer_facecam" or layout not in ("center_crop", "split"):
+                # OpenShorts Akilli Yayinci/Oyun Duzeni (Facecam + Gameplay)
+                # Uste yayinci kamerasi (1080x780), alta ana oyun/ekran (1080x1140)
                 face_x = "0"
-                face_y = "0"
-            elif pos == "top_right":
-                face_x = "iw*0.64"
-                face_y = "0"
+                face_y = "ih*0.52"
+                pos = getattr(settings, "facecam_position", "auto") or "auto"
+                if pos == "auto":
+                    pos = self.detect_facecam_position(clip.raw_video_path)
+                    logger.info(f"Auto Facecam: '{clip.title[:30]}' kamera konumu otomatik olarak '{pos}' seçildi.")
 
-            filter_str = (
-                f"[0:v]crop=w=iw*0.36:h=ih*0.48:x={face_x}:y={face_y},"
-                f"scale=1080:780:force_original_aspect_ratio=increase,crop=1080:780[top_face];"
-                f"[0:v]scale=1080:1140:force_original_aspect_ratio=increase,crop=1080:1140[bot_game];"
-                f"[top_face][bot_game]vstack=inputs=2[base]"
-            )
-            final_v = "[base]"
-        elif layout == "blur_bg":
-            # 9:16 Arka plan bulanik + Ortada orijinal 16:9 keskin video
-            filter_str = (
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg];"
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-                "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]"
-            )
-            final_v = "[base]"
-        elif layout == "center_crop":
-            # Merkeze odaklanip dikey kirpma
-            filter_str = (
-                "[0:v]scale=-1:1920,crop=1080:1920[base]"
-            )
-            final_v = "[base]"
-        else: # split screen (esit iki parca)
-            filter_str = (
-                "[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];"
-                "[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bot];"
-                "[top][bot]vstack=inputs=2[base]"
-            )
-            final_v = "[base]"
+                if pos == "bottom_right":
+                    face_x = "iw*0.64"
+                    face_y = "ih*0.52"
+                elif pos == "top_left":
+                    face_x = "0"
+                    face_y = "0"
+                elif pos == "top_right":
+                    face_x = "iw*0.64"
+                    face_y = "0"
+
+                filter_str = (
+                    f"[0:v]crop=w=iw*0.36:h=ih*0.48:x={face_x}:y={face_y},"
+                    f"scale=1080:780:force_original_aspect_ratio=increase,crop=1080:780[top_face];"
+                    f"[0:v]scale=1080:1140:force_original_aspect_ratio=increase,crop=1080:1140[bot_game];"
+                    f"[top_face][bot_game]vstack=inputs=2[base]"
+                )
+                final_v = "[base]"
+            elif layout == "center_crop":
+                # Merkeze odaklanip dikey tam ekran zoom & kirpma
+                filter_str = (
+                    "[0:v]scale=-1:1920,crop=1080:1920[base]"
+                )
+                final_v = "[base]"
+            else: # split screen (esit iki parca)
+                filter_str = (
+                    "[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];"
+                    "[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bot];"
+                    "[top][bot]vstack=inputs=2[base]"
+                )
+                final_v = "[base]"
 
         # Kanca çıkartması overlay (videonun ilk 7 saniyesinde tepe ortada göster)
         if hook_available:
@@ -424,20 +821,44 @@ class ClipEditorService:
         if hook_available:
             cmd.extend(["-i", temp_hook_path])
 
+        encoder_args, used_codec = self._get_encoder_args()
+
         cmd.extend([
             "-filter_complex", filter_str,
             "-map", map_v,
             "-map", "0:a?",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "22",
+            *encoder_args,
             "-c:a", "aac",
             "-b:a", "192k",
             out_shorts_path
         ])
 
-        logger.info(f"Rendering 9:16 Shorts with FFmpeg to {out_shorts_path} (layout={layout}, hook={hook_available})...")
+        video_progress_tracker.update_stage(
+            stage="rendering",
+            stage_label="9:16 Render (%75)",
+            percent=75.0,
+            detail=f"FFmpeg dikey video montajı yapılıyor ({used_codec}, layout={layout})..."
+        )
+        logger.info(f"Rendering 9:16 Shorts with FFmpeg to {out_shorts_path} (codec={used_codec}, layout={layout}, hook={hook_available})...")
         res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=600)
+
+        # GPU nvenc basarisiz olursa CPU (libx264) fallback ile tekrar dene
+        if res.returncode != 0 and used_codec == "h264_nvenc":
+            logger.warning(f"NVENC GPU render failed ({res.stderr[:200]}), falling back to CPU (libx264)...")
+            fallback_cmd = []
+            skip_next = False
+            for idx, arg in enumerate(cmd):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == "-c:v" and idx + 1 < len(cmd) and cmd[idx + 1] == "h264_nvenc":
+                    fallback_cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "22"])
+                    skip_next = True
+                elif arg in ("-preset", "-cq") and idx + 1 < len(cmd):
+                    skip_next = True
+                else:
+                    fallback_cmd.append(arg)
+            res = subprocess.run(fallback_cmd, capture_output=True, text=True, errors="replace", timeout=600)
 
         if res.returncode != 0:
             err = f"FFmpeg render error: {res.stderr}"
@@ -492,12 +913,11 @@ class ClipEditorService:
             cmd.extend(["-t", str(duration_sec)])
 
         if reencode:
+            encoder_args, _ = self._get_encoder_args()
             # Kesme varsa yeniden kodla (senkron ve kare hizalamasi icin)
             cmd.extend([
                 "-i", raw_path,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "22",
+                *encoder_args,
                 "-c:a", "aac",
                 "-b:a", "192k",
                 out_path

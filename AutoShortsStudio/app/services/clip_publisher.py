@@ -77,6 +77,36 @@ class ClipPublisherService:
                 return True, f"{h:02d}:{m:02d}"
         return False, None
 
+    def is_slot_published_today(
+        self,
+        target_format: ClipTargetFormat,
+        slot_name: str,
+        settings: ClipPipelineSettings,
+        now: Optional[datetime] = None,
+        window_minutes: int = 45
+    ) -> bool:
+        """
+        Mevcut Prime Time slot penceresinde (orn: 18:00 icin 17:50 - 18:45)
+        ilgili formatta bugun zaten en az 1 video yayinlandi mi kontrol eder.
+        Boylece ayni slot penceresinde birden fazla video yuklenmesi onlenir (1-1-1 garantisi).
+        """
+        try:
+            h, m = map(int, slot_name.split(":", 1))
+        except Exception:
+            return False
+
+        dt = now or datetime.now()
+        slot_dt = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        win_start = (slot_dt - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        win_end = (slot_dt + timedelta(minutes=window_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+        count = clip_db.count_published_between(
+            target_format=target_format.value,
+            start_iso=win_start,
+            end_iso=win_end
+        )
+        return count > 0
+
     def calculate_schedule_for_stock(
         self,
         target_format: ClipTargetFormat,
@@ -115,11 +145,15 @@ class ClipPublisherService:
             slot_queue.append((0, s))
 
         # Sonraki gunler icin slot havuzu genisletilir
+        effective_lim = max(1, daily_lim)
+        candidate_slots = slots if slots else [(18, 0), (20, 0), (22, 0)]
         day = 1
         while len(slot_queue) < len(ready_clips) + 10:
-            for s in slots[:daily_lim]:
+            for s in candidate_slots[:effective_lim]:
                 slot_queue.append((day, s))
             day += 1
+            if day > 365:
+                break
 
         for idx, clip in enumerate(ready_clips):
             if idx < len(slot_queue):
@@ -141,10 +175,10 @@ class ClipPublisherService:
 
         return scheduled_pairs
 
-    def update_scheduled_times_in_db(self, settings: ClipPipelineSettings):
+    def update_scheduled_times_in_db(self, settings: ClipPipelineSettings, now: Optional[datetime] = None):
         """Stoktaki videolara hesaplanan planlanmis yayin zamanlarini yazar."""
         for fmt in ClipTargetFormat:
-            pairs = self.calculate_schedule_for_stock(fmt, settings)
+            pairs = self.calculate_schedule_for_stock(fmt, settings, now=now)
             for clip, sched_dt, label in pairs:
                 if clip.scheduled_publish_time != sched_dt:
                     clip.scheduled_publish_time = sched_dt
@@ -192,19 +226,19 @@ class ClipPublisherService:
             "youtube_video_id": video_id,
         }
 
-    def run_publish_tick(self, settings: ClipPipelineSettings) -> Dict[str, Any]:
+    def run_publish_tick(self, settings: ClipPipelineSettings, now: Optional[datetime] = None) -> Dict[str, Any]:
         """
         Zamanlayici tarafindan periyodik cagrilir.
         Her format icin:
         - Stoktaki planlanmis saatleri gunceller.
         - Kota var mi + yayin penceresinde / Prime Time'da miyiz + stokta READY var mi kontrol eder.
-        - Uygunsa en yuksek oncelikli videoyu yukler.
+        - Uygunsa en yuksek oncelikli videoyu yukler (Prime Time slotu basina 1 video siniri ile).
         """
         result: Dict[str, Any] = {"published": [], "skipped": {}}
 
         # Oncelikle stok zamanlamasini guncelle
         try:
-            self.update_scheduled_times_in_db(settings)
+            self.update_scheduled_times_in_db(settings, now=now)
         except Exception as ex:
             logger.debug(f"Failed to update scheduled publish times: {ex}")
 
@@ -212,32 +246,48 @@ class ClipPublisherService:
             result["skipped"]["reason"] = "auto_upload kapali"
             return result
 
-        if not self.is_within_publish_window(settings):
+        if not self.is_within_publish_window(settings, now=now):
             result["skipped"]["reason"] = (
                 f"yayin penceresi disinda ({settings.publish_window_start_hour}:00 - "
                 f"{settings.publish_window_end_hour}:00)"
             )
             return result
 
-        is_prime, slot_name = self.is_prime_time_now(settings)
+        is_prime, slot_name = self.is_prime_time_now(settings, now=now)
+        enforce_prime = getattr(settings, "enforce_prime_time", True)
+        if enforce_prime:
+            if not is_prime:
+                expected = settings.prime_time_slots or "18:00, 20:00, 22:00"
+                result["skipped"]["reason"] = f"Prime Time disinda (Beklenen: {expected})"
+                return result
 
         for fmt in ClipTargetFormat:
             remaining = self.quota_remaining(fmt, settings)
+            daily_lim = self.daily_limit(fmt, settings)
             if remaining <= 0:
-                result["skipped"][fmt.value] = "gunluk kota dolu (3/3 tamamlandi)"
+                result["skipped"][fmt.value] = f"gunluk kota dolu ({daily_lim}/{daily_lim} tamamlandi)"
                 continue
 
-            # Prime Time kontrolu: Eğer oto-yükleme açıksa ve şu an Prime Time slotu içindeysek kesinlikle yayınla
-            published_info = self.publish_next_ready(fmt, settings)
-            if published_info:
-                result["published"].append(published_info)
-                slot_info = f" [{slot_name} Prime Time]" if is_prime else ""
-                logger.info(
-                    f"[Publisher] {fmt.value}{slot_info} yuklendi: {published_info['title']} "
-                    f"(https://youtu.be/{published_info['youtube_video_id']})"
-                )
-            else:
-                result["skipped"][fmt.value] = "stokta READY video yok veya YouTube hazir degil"
+            # K1 onlemi: Prime Time aktifken bu slot penceresinde (orn: 18:00) bugun zaten video atildiysa bekle (1-1-1 garantisi)
+            if enforce_prime and is_prime and slot_name:
+                if self.is_slot_published_today(fmt, slot_name, settings, now=now):
+                    result["skipped"][fmt.value] = f"{slot_name} Prime Time slotu icin bugun zaten 1 video yuklendi"
+                    continue
+
+            try:
+                published_info = self.publish_next_ready(fmt, settings)
+                if published_info:
+                    result["published"].append(published_info)
+                    slot_info = f" [{slot_name} Prime Time]" if is_prime else ""
+                    logger.info(
+                        f"[Publisher] {fmt.value}{slot_info} yuklendi: {published_info['title']} "
+                        f"(https://youtu.be/{published_info['youtube_video_id']})"
+                    )
+                else:
+                    result["skipped"][fmt.value] = "stokta READY video yok veya YouTube hazir degil"
+            except Exception as e:
+                logger.error(f"[Publisher] {fmt.value} yayinlama hatasi: {e}")
+                result["skipped"][fmt.value] = f"yayinlama hatasi: {e}"
 
         return result
 

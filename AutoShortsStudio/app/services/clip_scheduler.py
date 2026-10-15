@@ -16,6 +16,7 @@ from app.services.hype_detector import hype_detector
 from app.services.clip_editor import clip_editor
 from app.services.shorts_publisher import shorts_publisher
 from app.services.clip_publisher import clip_publisher
+from app.services.clip_ai_seo import clip_ai_seo
 
 
 class ClipSchedulerService:
@@ -31,7 +32,7 @@ class ClipSchedulerService:
         self._stop_event = threading.Event()
         self._is_running = False
         self._lock = threading.Lock()
-        self._pipeline_lock = threading.Lock()
+        self._pipeline_lock = threading.RLock()
         self._logs: List[Dict[str, Any]] = []
         self._current_task_info = "Beklemede (Idle)"
 
@@ -136,7 +137,7 @@ class ClipSchedulerService:
 
                 # 1. Indirme (onceden inmis ise indirme atlanir, ayni kaynagin ikizleri tek dosyayi paylasir)
                 raw_path = clip.raw_video_path
-                if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 10240:
+                if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 1024:
                     self._add_log(f"Zaten indirilmis video kullaniliyor (indirme atlandi): {os.path.basename(raw_path)}", "info")
                     video_progress_tracker.update_stage(
                         stage="downloaded",
@@ -147,7 +148,7 @@ class ClipSchedulerService:
                 else:
                     self._current_task_info = f"İndiriliyor: {clip.title[:30]}"
                     self._add_log(f"Video indiriliyor: {clip.url}", "info")
-                    raw_path = clip_downloader.download_clip(clip)
+                    raw_path = clip_downloader.download_clip(clip, settings=settings)
 
                 if clip.target_format == ClipTargetFormat.HORIZONTAL:
                     publish_target = self._process_horizontal(clip, raw_path, settings,
@@ -317,28 +318,74 @@ class ClipSchedulerService:
             cut_end_sec=end_sec
         )
 
-        # Otomatik thumbnail yakalama
+        # AI Destekli Özgün Paket (Başlık, Açıklama, Etiketler, Kategori, Clickbait Thumbnail)
+        video_progress_tracker.update_stage(
+            stage="thumbnail",
+            stage_label="AI Başlık, SEO & Kapak Görseli (%90)",
+            percent=90.0,
+            detail="Seçili AI modeli ile özgün viral başlık, SEO açıklaması ve kapak görseli hazırlanıyor..."
+        )
+        try:
+            ai_meta = clip_ai_seo.generate_monetization_metadata(clip, ClipTargetFormat.SHORTS, settings=settings)
+            if not clip.youtube_title:
+                clip.youtube_title = ai_meta["title"]
+            clip.youtube_description = ai_meta["description"]
+            clip.youtube_tags = ai_meta["tags"]
+            clip.youtube_category_id = ai_meta["category_id"]
+            if not clip.hook_text and ai_meta.get("hook_text"):
+                clip.hook_text = ai_meta["hook_text"]
+            clip.made_for_kids = False
+            clip.age_restricted = False
+            self._add_log(f"AI Özgün Başlık: '{clip.youtube_title}' (Kategori: {clip.youtube_category_id})", "info")
+        except Exception as ai_err:
+            logger.warning(f"AI monetization metadata failed: {ai_err}")
+
+        # Clickbait Thumbnail Studio (Kalın Sarı Metinli Profesyonel Kapak)
         if settings.auto_generate_thumbnail and clip.processed_video_path and os.path.exists(clip.processed_video_path):
-            video_progress_tracker.update_stage(
-                stage="thumbnail",
-                stage_label="Kapak Görseli Çıkarılıyor (%90)",
-                percent=90.0,
-                detail="Viral andan yüksek çözünürlüklü kapak karesi yakalanıyor..."
-            )
             base_dir = os.path.dirname(clip.processed_video_path)
             stem = os.path.splitext(os.path.basename(clip.processed_video_path))[0]
             thumb_file = os.path.join(base_dir, f"{stem}_thumb.jpg")
             sample_time = max(1.0, (end_sec - start_sec) * 0.3)
-            if hype_detector.extract_thumbnail_frame(clip.processed_video_path, sample_time, thumb_file):
-                clip.custom_thumbnail_path = thumb_file
-                clip_db.update_clip_metadata(clip.clip_id, custom_thumbnail_path=thumb_file)
+            created_thumb = clip_ai_seo.create_clickbait_thumbnail(
+                video_path=clip.processed_video_path,
+                hook_text=clip.hook_text or "İNANILMAZ ANLAR!",
+                target_format=ClipTargetFormat.SHORTS,
+                output_path=thumb_file,
+                timestamp_sec=sample_time
+            )
+            if created_thumb and os.path.exists(created_thumb):
+                clip.custom_thumbnail_path = created_thumb
+
+        # DB'ye tüm metadata'yı kaydet
+        clip_db.update_clip_metadata(
+            clip.clip_id,
+            youtube_title=clip.youtube_title,
+            youtube_description=clip.youtube_description,
+            youtube_tags=clip.youtube_tags,
+            youtube_category_id=clip.youtube_category_id,
+            hook_text=clip.hook_text,
+            made_for_kids=False,
+            age_restricted=False,
+            custom_thumbnail_path=clip.custom_thumbnail_path
+        )
 
         video_progress_tracker.update_stage(
             stage="ready",
             stage_label="Stokta Hazırlandı (%100)",
             percent=100.0,
-            detail="Shorts kurgusu tamamlandı ve stok havuzuna eklendi."
+            detail="Shorts kurgusu ve AI paketi tamamlandı, stok havuzuna eklendi."
         )
+
+        # Taslak olarak onceden YouTube'a yukleme kontrolu
+        if getattr(settings, "pre_upload_as_draft", True) and shorts_publisher.is_youtube_ready():
+            try:
+                self._add_log(f"Shorts YouTube'a taslak olarak yukleniyor (yayin saati geldiginde saniyesinde herkese acik yapilacak)...", "info")
+                draft_id = shorts_publisher.pre_upload_draft(clip, settings=settings)
+                if draft_id:
+                    self._add_log(f"Taslak YouTube'da hazir! Video ID: {draft_id}", "info")
+            except Exception as pre_err:
+                logger.warning(f"Shorts pre-upload draft failed: {pre_err}")
+
         return clip
 
     def _process_horizontal(
@@ -396,27 +443,73 @@ class ClipSchedulerService:
 
         ready_item = ready_items[0] if ready_items else clip
 
+        # AI Destekli Özgün Paket (Başlık, Açıklama, Etiketler, Kategori, Clickbait Thumbnail)
+        video_progress_tracker.update_stage(
+            stage="thumbnail",
+            stage_label="AI Başlık, SEO & Kapak Görseli (%90)",
+            percent=90.0,
+            detail="Yatay video için seçili AI modeliyle özgün başlık, SEO açıklaması ve kapak görseli hazırlanıyor..."
+        )
+        try:
+            ai_meta = clip_ai_seo.generate_monetization_metadata(ready_item, ClipTargetFormat.HORIZONTAL, settings=settings)
+            if not ready_item.youtube_title:
+                ready_item.youtube_title = ai_meta["title"]
+            ready_item.youtube_description = ai_meta["description"]
+            ready_item.youtube_tags = ai_meta["tags"]
+            ready_item.youtube_category_id = ai_meta["category_id"]
+            if not ready_item.hook_text and ai_meta.get("hook_text"):
+                ready_item.hook_text = ai_meta["hook_text"]
+            ready_item.made_for_kids = False
+            ready_item.age_restricted = False
+            self._add_log(f"AI Özgün Başlık (Yatay): '{ready_item.youtube_title}' (Kategori: {ready_item.youtube_category_id})", "info")
+        except Exception as ai_err:
+            logger.warning(f"AI monetization metadata failed for horizontal video: {ai_err}")
+
+        # Clickbait Thumbnail Studio (16:9 Kalın Sarı Metinli YouTube Kapağı)
         if settings.auto_generate_thumbnail and ready_item.processed_video_path and os.path.exists(ready_item.processed_video_path):
-            video_progress_tracker.update_stage(
-                stage="thumbnail",
-                stage_label="Kapak Görseli Çıkarılıyor (%90)",
-                percent=90.0,
-                detail="Yatay video için kapak karesi yakalanıyor..."
-            )
             base_dir = os.path.dirname(ready_item.processed_video_path)
             stem = os.path.splitext(os.path.basename(ready_item.processed_video_path))[0]
             thumb_file = os.path.join(base_dir, f"{stem}_thumb.jpg")
             sample_time = max(5.0, min(30.0, ready_item.duration * 0.2 if ready_item.duration else 10.0))
-            if hype_detector.extract_thumbnail_frame(ready_item.processed_video_path, sample_time, thumb_file):
-                ready_item.custom_thumbnail_path = thumb_file
-                clip_db.update_clip_metadata(ready_item.clip_id, custom_thumbnail_path=thumb_file)
+            created_thumb = clip_ai_seo.create_clickbait_thumbnail(
+                video_path=ready_item.processed_video_path,
+                hook_text=ready_item.hook_text or "İNANILMAZ ANLAR!",
+                target_format=ClipTargetFormat.HORIZONTAL,
+                output_path=thumb_file,
+                timestamp_sec=sample_time
+            )
+            if created_thumb and os.path.exists(created_thumb):
+                ready_item.custom_thumbnail_path = created_thumb
+
+        # DB'ye tüm metadata'yı kaydet
+        clip_db.update_clip_metadata(
+            ready_item.clip_id,
+            youtube_title=ready_item.youtube_title,
+            youtube_description=ready_item.youtube_description,
+            youtube_tags=ready_item.youtube_tags,
+            youtube_category_id=ready_item.youtube_category_id,
+            hook_text=ready_item.hook_text,
+            made_for_kids=False,
+            age_restricted=False,
+            custom_thumbnail_path=ready_item.custom_thumbnail_path
+        )
 
         video_progress_tracker.update_stage(
             stage="ready",
             stage_label="Stokta Hazırlandı (%100)",
             percent=100.0,
-            detail="Yatay video kurgusu tamamlandı ve stok havuzuna eklendi."
+            detail="Yatay video kurgusu ve AI paketi tamamlandı, stok havuzuna eklendi."
         )
+
+        # Taslak olarak onceden YouTube'a yukleme kontrolu
+        if getattr(settings, "pre_upload_as_draft", True) and shorts_publisher.is_youtube_ready():
+            try:
+                self._add_log(f"Yatay video YouTube'a taslak olarak yukleniyor (yayin saati geldiginde saniyesinde herkese acik yapilacak)...", "info")
+                draft_id = shorts_publisher.pre_upload_draft(ready_item, settings=settings)
+                if draft_id:
+                    self._add_log(f"Yatay taslak YouTube'da hazir! Video ID: {draft_id}", "info")
+            except Exception as pre_err:
+                logger.warning(f"Horizontal pre-upload draft failed: {pre_err}")
 
         if len(ready_items) > 1:
             self._add_log(
@@ -560,7 +653,7 @@ class ClipSchedulerService:
 
         # 1. Yatay stok oncelikli kontrolu (hedef: 3 hazir video)
         if ready_h < target_h and not self._stop_event.is_set():
-            next_h = clip_db.next_discovered_clip(ClipTargetFormat.HORIZONTAL.value)
+            next_h = clip_db.next_discovered_clip(ClipTargetFormat.HORIZONTAL.value, settings=settings)
             if next_h:
                 self._add_log(
                     f"Yatay stok eksik ({ready_h}/{target_h}). 1 video sirayla indiriliyor ve isleniyor: '{next_h.title[:45]}'",
@@ -574,7 +667,7 @@ class ClipSchedulerService:
 
         # 2. Shorts stok kontrolu (hedef: 6 hazir video)
         if ready_s < target_s and not self._stop_event.is_set():
-            next_s = clip_db.next_discovered_clip(ClipTargetFormat.SHORTS.value)
+            next_s = clip_db.next_discovered_clip(ClipTargetFormat.SHORTS.value, settings=settings)
             if next_s:
                 self._add_log(
                     f"Shorts stok eksik ({ready_s}/{target_s}). 1 video sirayla indiriliyor ve isleniyor: '{next_s.title[:45]}'",
@@ -590,11 +683,12 @@ class ClipSchedulerService:
         """Gunluk kota ve yayin penceresi dahilinde stoktan YouTube'a yukler."""
         if self._stop_event.is_set():
             return
-        try:
-            summary = clip_publisher.run_publish_tick(settings)
-        except Exception as e:
-            self._add_log(f"Yayinlama hatasi: {str(e)[:150]}", "error")
-            return
+        with self._pipeline_lock:
+            try:
+                summary = clip_publisher.run_publish_tick(settings)
+            except Exception as e:
+                self._add_log(f"Yayinlama hatasi: {str(e)[:150]}", "error")
+                return
 
         published = summary.get("published", [])
         if published:

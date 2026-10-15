@@ -47,6 +47,7 @@ from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
 from app.services import version_checker
+from app.services.hardware_detector import hardware_detector
 from app.services.youtube_uploader import youtube_uploader_service
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
@@ -714,7 +715,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         play_label,
                         key=f"play_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/play_arrow:",
                         help=play_label,
                         disabled=not has_video,
@@ -726,7 +727,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         open_label,
                         key=f"open_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/folder_open:",
                         help=open_label,
                     ):
@@ -737,7 +738,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         restore_label,
                         key=f"restore_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/replay:",
                         help=restore_label,
                         disabled=is_processing or not has_restore_data,
@@ -748,7 +749,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         "Upload",
                         key=f"upload_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/cloud_upload:",
                         help="Projeyi YouTube / Diğer platformlara yükle",
                         disabled=is_busy or not has_video,
@@ -770,7 +771,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         delete_label,
                         key=f"delete_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/delete:",
                         help=delete_help,
                         disabled=is_busy,
@@ -1034,7 +1035,7 @@ def _render_task_restore_dialog(task_id):
     if cancel_col.button(
         tr("Cancel"),
         key="cancel_task_restore",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state.pop("task_restore_candidate_id", None)
         st.rerun(scope="app")
@@ -1042,7 +1043,7 @@ def _render_task_restore_dialog(task_id):
         tr("Load Task Configuration"),
         key="confirm_task_restore",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state["task_restore_payload"] = payload
         st.session_state.pop("task_restore_candidate_id", None)
@@ -1780,7 +1781,7 @@ def _render_cache_management_settings(panel):
         if refresh_col.button(
             tr("Refresh Cache Stats"),
             key="refresh_video_cache_stats",
-            use_container_width=True,
+            width="stretch",
             icon=":material/refresh:",
         ):
             _get_video_cache_stats.clear()
@@ -1789,7 +1790,7 @@ def _render_cache_management_settings(panel):
         if open_col.button(
             tr("Open Cache Directory"),
             key="open_video_cache_directory",
-            use_container_width=True,
+            width="stretch",
             icon=":material/folder_open:",
         ):
             webbrowser.open(Path(cache_manager.video_cache_dir()).as_uri())
@@ -1800,7 +1801,7 @@ def _render_cache_management_settings(panel):
             key="clean_video_cache_now",
             type="primary",
             disabled=cleanup_disabled,
-            use_container_width=True,
+            width="stretch",
             icon=":material/delete_sweep:",
         ):
             result = cache_manager.clean_video_cache(max_age_days=max_age_days)
@@ -1846,17 +1847,68 @@ def _render_settings_dialog():
         config.app["hide_config"] = False
         (
             middle_config_panel,
+            hardware_config_panel,
             right_config_panel,
             cache_config_panel,
             left_config_panel,
         ) = st.tabs(
             [
                 tr("LLM Settings Tab"),
+                "⚡ Donanım / GPU",
                 tr("Material API Tab"),
                 tr("Cache Management Tab"),
                 tr("Interface Settings Tab"),
             ]
         )
+
+        # Donanım & Render Hızlandırma Paneli
+        with hardware_config_panel:
+            st.markdown("##### ⚡ Donanım Hızlandırma & Render Motoru")
+            st.caption("Video montajı ve klip render işlemlerinde sistem donanımının nasıl kullanılacağını belirleyin.")
+
+            hw = hardware_detector.detect()
+            has_nvidia = hw.get("has_nvidia", False)
+            has_amd = hw.get("has_amd", False)
+            gpu_name = hw.get("gpu_name", "Standart Ekran Kartı")
+
+            if has_nvidia:
+                st.success(f"🟢 **NVIDIA Ekran Kartı Tespit Edildi:** `{gpu_name}`\n\nNVIDIA NVENC donanım hızlandırma destekleniyor (5 kat daha hızlı render).")
+            elif has_amd:
+                st.info(f"🔵 **AMD Ekran Kartı Tespit Edildi:** `{gpu_name}`\n\nAMD sistemlerde en yüksek uyumluluk ve kararlılık için **CPU (x264)** modu önerilir.")
+            else:
+                st.info(f"ℹ️ **Sistem Donanımı:** `{gpu_name}`")
+
+            saved_hw = config.app.get("hardware_mode")
+            if not saved_hw:
+                def_mode = hw.get("recommended_mode", "cpu")
+            else:
+                def_mode = saved_hw.lower()
+
+            hw_options = ["gpu", "cpu"]
+            hw_captions = [
+                "⚡ GPU Hızlandırma (NVIDIA NVENC - Ultra Hızlı)" + (" [Önerilen]" if has_nvidia else ""),
+                "🖥️ İşlemci (CPU libx264 - Evrensel & Kararlı)" + (" [Önerilen]" if not has_nvidia else ""),
+            ]
+            hw_idx = 0 if def_mode == "gpu" else 1
+
+            new_hw = st.radio(
+                "Render Motoru:",
+                options=hw_options,
+                index=hw_idx,
+                format_func=lambda x: hw_captions[0] if x == "gpu" else hw_captions[1],
+                key="settings_hw_mode_radio"
+            )
+            config.app["hardware_mode"] = new_hw
+            config.app["video_codec"] = hardware_detector.get_effective_codec(new_hw)
+
+            st.markdown("---")
+            st.markdown("##### 🚀 İlk Kurulum Kılavuzu")
+            st.caption("Uygulamanın ilk açılış sihirbazını yeniden başlatarak donanım, AI ve YouTube ayarlarını adım adım yapılandırabilirsiniz.")
+            if st.button("🚀 Kurulum Kılavuzunu (Setup Wizard) Yeniden Aç", key="btn_reopen_wizard", use_container_width=True):
+                st.session_state["show_setup_wizard"] = True
+                st.session_state["wizard_step"] = 1
+                st.session_state["settings_dialog_open"] = False
+                st.rerun()
 
         # 左侧面板 - 日志设置
         with left_config_panel:
@@ -1869,11 +1921,15 @@ def _render_settings_dialog():
 
         _render_cache_management_settings(cache_config_panel)
 
-        # 中间面板 - LLM 设置
+        # 中间面板 - LLM 设置 (3 Kademeli Kesintisiz AI Zekası: Main + Fallback 1 + Fallback 2)
 
         with middle_config_panel:
-            # 下拉顺序、默认 label 和稳定 provider id 全部来自 Registry；locale
-            # 只覆盖展示文案，不再让 Main.py 维护第二份 Provider 列表。
+            st.markdown("##### 🧠 3 Kademeli Kesintisiz AI Zekası (Main + Fallback 1 + Fallback 2)")
+            st.caption(
+                "Video metni, başlık, açıklama ve SEO etiketlerini sıfırdan üreten kesintisiz AI zinciri. "
+                "Ana AI kotası dolarsa veya hata verirse sistem çökmez; otomatik 1. Yedek AI'a, o da başarısız olursa 2. Yedek AI'a geçer."
+            )
+
             llm_provider_ids = [
                 provider.provider_id for provider in LLM_PROVIDER_REGISTRY
             ]
@@ -1881,172 +1937,437 @@ def _render_settings_dialog():
                 provider.provider_id: get_llm_provider_label(provider)
                 for provider in LLM_PROVIDER_REGISTRY
             }
-            saved_llm_provider = config.app.get(
-                "llm_provider", DEFAULT_LLM_PROVIDER_ID
-            ).lower()
-            if saved_llm_provider not in llm_provider_ids:
-                saved_llm_provider = DEFAULT_LLM_PROVIDER_ID
+            fb_choices = ["none"] + llm_provider_ids
+            fb_labels = {"none": "🚫 Devre Dışı (Kullanma)", **llm_provider_labels}
 
-            llm_provider = stable_selectbox(
-                tr("LLM Provider"),
-                options=llm_provider_ids,
-                default_value=saved_llm_provider,
-                key="llm_provider_select",
-                format_func=lambda provider_id: llm_provider_labels[provider_id],
-            )
-            # 配置表单和 Provider 说明并排展示，减少长说明在窄列中的换行，
-            # 同时充分利用基础设置面板的横向空间。
-            llm_form_panel, llm_help_panel = st.columns(
-                [0.9, 1.1],
-                gap="large",
-                vertical_alignment="top",
-            )
-            llm_helper = llm_help_panel.container()
-            config.app["llm_provider"] = llm_provider
-            llm_provider_spec = get_llm_provider(llm_provider)
-            if llm_provider_spec is None:
-                # 正常情况下下拉选项全部来自 Registry，不会进入该分支；保留
-                # 明确错误用于诊断损坏的 session state 或后续接入遗漏。
-                raise RuntimeError(f"unsupported llm provider: {llm_provider}")
-
-            llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
-            llm_base_url = (
-                config.app.get(llm_provider_spec.config_key("base_url"), "")
-                or llm_provider_spec.default_base_url
-            )
-            llm_default_base_url = llm_provider_spec.default_base_url
-            llm_model_name = llm_provider_spec.resolve_model_name(
-                config.app.get(llm_provider_spec.config_key("model_name"), "")
+            tab_main_llm, tab_fb1_llm, tab_fb2_llm = st.tabs(
+                [
+                    "🌟 Ana AI (Main LLM)",
+                    "🛡️ 1. Yedek AI (Fallback 1)",
+                    "🛡️ 2. Yedek AI (Fallback 2)",
+                ]
             )
 
-            provider_tip_context = {}
-            if llm_provider == "ollama":
-                llm_default_base_url = config.get_default_ollama_base_url()
-                if not llm_base_url:
-                    llm_base_url = llm_default_base_url
-                docker_hint = ""
-                if config.is_running_in_container():
-                    docker_hint = tr_optional(
-                        "llm_provider_tips.ollama.docker_hint",
-                        fallback_language="en",
+            # ================= TAB 1: ANA AI (MAIN LLM) =================
+            with tab_main_llm:
+                saved_llm_provider = config.app.get(
+                    "llm_provider", DEFAULT_LLM_PROVIDER_ID
+                ).lower()
+                if saved_llm_provider not in llm_provider_ids:
+                    saved_llm_provider = DEFAULT_LLM_PROVIDER_ID
+
+                llm_provider = stable_selectbox(
+                    tr("LLM Provider"),
+                    options=llm_provider_ids,
+                    default_value=saved_llm_provider,
+                    key="llm_provider_select",
+                    format_func=lambda provider_id: llm_provider_labels[provider_id],
+                )
+                llm_form_panel, llm_help_panel = st.columns(
+                    [0.9, 1.1],
+                    gap="large",
+                    vertical_alignment="top",
+                )
+                llm_helper = llm_help_panel.container()
+                config.app["llm_provider"] = llm_provider
+                llm_provider_spec = get_llm_provider(llm_provider)
+                if llm_provider_spec is None:
+                    raise RuntimeError(f"unsupported llm provider: {llm_provider}")
+
+                llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
+                llm_base_url = (
+                    config.app.get(llm_provider_spec.config_key("base_url"), "")
+                    or llm_provider_spec.default_base_url
+                )
+                llm_default_base_url = llm_provider_spec.default_base_url
+                llm_model_name = llm_provider_spec.resolve_model_name(
+                    config.app.get(llm_provider_spec.config_key("model_name"), "")
+                )
+
+                provider_tip_context = {}
+                if llm_provider == "ollama":
+                    llm_default_base_url = config.get_default_ollama_base_url()
+                    if not llm_base_url:
+                        llm_base_url = llm_default_base_url
+                    docker_hint = ""
+                    if config.is_running_in_container():
+                        docker_hint = tr_optional(
+                            "llm_provider_tips.ollama.docker_hint",
+                            fallback_language="en",
+                        )
+                    provider_tip_context["docker_hint"] = docker_hint
+
+                tips = get_llm_provider_tips(llm_provider, **provider_tip_context)
+                if tips:
+                    with llm_helper:
+                        st.info(tips)
+
+                st_llm_api_key = llm_api_key
+                if llm_provider_spec.show_api_key:
+                    st_llm_api_key = llm_form_panel.text_input(
+                        tr("API Key"),
+                        value=llm_api_key,
+                        type="password",
+                        key=f"{llm_provider}_api_key_input",
                     )
-                provider_tip_context["docker_hint"] = docker_hint
 
-            tips = get_llm_provider_tips(llm_provider, **provider_tip_context)
-            if tips:
-                with llm_helper:
-                    st.info(tips)
-
-            st_llm_api_key = llm_api_key
-            if llm_provider_spec.show_api_key:
-                st_llm_api_key = llm_form_panel.text_input(
-                    tr("API Key"),
-                    value=llm_api_key,
-                    type="password",
-                    key=f"{llm_provider}_api_key_input",
-                )
-
-            st_llm_base_url = llm_base_url
-            if llm_provider_spec.show_base_url:
-                st_llm_base_url = llm_form_panel.text_input(
-                    tr("Base Url"),
-                    value=llm_base_url,
-                    key=f"{llm_provider}_base_url_input",
-                )
-            st_llm_model_name = ""
-            if llm_provider == "groq":
-                effective_api_key = st_llm_api_key or llm_api_key
-                effective_base_url = st_llm_base_url or llm_base_url
-                groq_models = get_groq_model_ids(
-                    api_key=effective_api_key,
-                    base_url=effective_base_url,
-                )
-
-                if groq_models:
-                    selected_index = 0
-                    if llm_model_name in groq_models:
-                        selected_index = groq_models.index(llm_model_name)
-
-                    st_llm_model_name = llm_form_panel.selectbox(
-                        tr("Model Name"),
-                        options=groq_models,
-                        index=selected_index,
-                        key="groq_model_name_select",
+                st_llm_base_url = llm_base_url
+                if llm_provider_spec.show_base_url:
+                    st_llm_base_url = llm_form_panel.text_input(
+                        tr("Base Url"),
+                        value=llm_base_url,
+                        key=f"{llm_provider}_base_url_input",
                     )
+                st_llm_model_name = ""
+                if llm_provider == "groq":
+                    effective_api_key = st_llm_api_key or llm_api_key
+                    effective_base_url = st_llm_base_url or llm_base_url
+                    groq_models = get_groq_model_ids(
+                        api_key=effective_api_key,
+                        base_url=effective_base_url,
+                    )
+
+                    if groq_models:
+                        selected_index = 0
+                        if llm_model_name in groq_models:
+                            selected_index = groq_models.index(llm_model_name)
+
+                        st_llm_model_name = llm_form_panel.selectbox(
+                            tr("Model Name"),
+                            options=groq_models,
+                            index=selected_index,
+                            key="groq_model_name_select",
+                        )
+                    else:
+                        st_llm_model_name = llm_form_panel.text_input(
+                            tr("Model Name"),
+                            value=llm_model_name,
+                            key="groq_model_name_input",
+                        )
+                        if effective_api_key:
+                            llm_form_panel.caption(tr("Groq Model List Load Failed"))
+                        else:
+                            llm_form_panel.caption(
+                                tr("Groq API Key Required for Model List")
+                            )
                 else:
                     st_llm_model_name = llm_form_panel.text_input(
                         tr("Model Name"),
                         value=llm_model_name,
-                        key="groq_model_name_input",
+                        key=f"{llm_provider}_model_name_input",
                     )
-                    if effective_api_key:
-                        llm_form_panel.caption(tr("Groq Model List Load Failed"))
+
+                config.app[llm_provider_spec.config_key("api_key")] = st_llm_api_key
+                config.app[llm_provider_spec.config_key("base_url")] = (
+                    normalize_provider_override(
+                        st_llm_base_url,
+                        llm_default_base_url,
+                    )
+                )
+                config.app[llm_provider_spec.config_key("model_name")] = (
+                    normalize_provider_override(
+                        st_llm_model_name,
+                        llm_provider_spec.default_model,
+                    )
+                )
+
+                for field in llm_provider_spec.extra_fields:
+                    field_config_key = llm_provider_spec.config_key(field.config_suffix)
+                    field_value = llm_form_panel.text_input(
+                        tr(field.label_key),
+                        value=(config.app.get(field_config_key, "") or field.default_value),
+                        type="password" if field.secret else "default",
+                        key=f"{llm_provider}_{field.config_suffix}_input",
+                    )
+                    config.app[field_config_key] = normalize_provider_override(
+                        field_value,
+                        field.default_value,
+                    )
+
+                if llm_form_panel.button(
+                    "🔌 Ana AI Bağlantısını Test Et",
+                    key="test_llm_connection_button",
+                    use_container_width=True,
+                    type="secondary",
+                    icon=":material/network_check:",
+                ):
+                    with llm_form_panel.spinner("Ana AI test ediliyor..."):
+                        with config.runtime_config_lock():
+                            connection_ok, connection_error, connection_elapsed = (
+                                llm.test_connection(
+                                    provider_id=llm_provider,
+                                    api_key=st_llm_api_key.strip() or None,
+                                    base_url=st_llm_base_url.strip() or None,
+                                    model_name=st_llm_model_name.strip() or None,
+                                )
+                            )
+
+                    if connection_ok:
+                        llm_form_panel.success(
+                            f"✅ Ana AI Hazır: '{llm_provider_labels[llm_provider]}' ({st_llm_model_name or 'varsayılan'}) yanıt verdi ({connection_elapsed:.2f}s)!"
+                        )
                     else:
-                        llm_form_panel.caption(
-                            tr("Groq API Key Required for Model List")
-                        )
-            else:
-                st_llm_model_name = llm_form_panel.text_input(
-                    tr("Model Name"),
-                    value=llm_model_name,
-                    key=f"{llm_provider}_model_name_input",
-                )
-            # 输入框展示 Registry 默认值，但配置只保存真实的用户覆盖值。
-            # 这样默认模型、Base URL 更新后，未自定义的用户能够自动跟随。
-            config.app[llm_provider_spec.config_key("api_key")] = st_llm_api_key
-            config.app[llm_provider_spec.config_key("base_url")] = (
-                normalize_provider_override(
-                    st_llm_base_url,
-                    llm_default_base_url,
-                )
-            )
-            config.app[llm_provider_spec.config_key("model_name")] = (
-                normalize_provider_override(
-                    st_llm_model_name,
-                    llm_provider_spec.default_model,
-                )
-            )
+                        llm_form_panel.error(f"❌ Ana AI Bağlantı Hatası: {connection_error}")
 
-            # Provider 专用字段也由 Registry 声明。例如 Cloudflare AI Gateway
-            # 需要 Account ID；以后新增类似字段时无需再在 Main.py 增加判断。
-            for field in llm_provider_spec.extra_fields:
-                field_config_key = llm_provider_spec.config_key(field.config_suffix)
-                field_value = llm_form_panel.text_input(
-                    tr(field.label_key),
-                    value=(config.app.get(field_config_key, "") or field.default_value),
-                    type="password" if field.secret else "default",
-                    key=f"{llm_provider}_{field.config_suffix}_input",
-                )
-                config.app[field_config_key] = normalize_provider_override(
-                    field_value,
-                    field.default_value,
-                )
+            # ================= TAB 2: 1. YEDEK AI (FALLBACK 1) =================
+            with tab_fb1_llm:
+                saved_fb1 = str(config.app.get("fallback_llm_provider", "none")).lower()
+                if saved_fb1 not in fb_choices:
+                    saved_fb1 = "none"
 
-            if llm_form_panel.button(
-                tr("Test LLM Connection"),
-                key="test_llm_connection_button",
-                use_container_width=True,
-                type="secondary",
-                icon=":material/network_check:",
-            ):
-                with llm_form_panel.spinner(tr("Testing LLM Connection")):
-                    with config.runtime_config_lock():
-                        connection_ok, connection_error, connection_elapsed = (
-                            llm.test_connection()
-                        )
+                fb1_provider = stable_selectbox(
+                    "1. Yedek AI Sağlayıcı",
+                    options=fb_choices,
+                    default_value=saved_fb1,
+                    key="llm_fallback1_provider_select",
+                    format_func=lambda pid: fb_labels.get(pid, pid),
+                )
+                config.app["fallback_llm_provider"] = fb1_provider
 
-                if connection_ok:
-                    llm_form_panel.success(
-                        tr("LLM Connection Test Succeeded").format(
-                            provider=llm_provider_labels[llm_provider],
-                            model=st_llm_model_name or "-",
-                            elapsed=f"{connection_elapsed:.2f}",
-                        )
-                    )
+                if fb1_provider == "none":
+                    st.info("🛡️ 1. Yedek AI devre dışı. Ana AI kota aşımı veya hata yaşarsa yedek devreye girmeyecek.")
+                    config.app["fallback_llm_api_key"] = ""
+                    config.app["fallback_llm_model_name"] = ""
+                    config.app["fallback_llm_base_url"] = ""
                 else:
-                    llm_form_panel.error(
-                        tr("LLM Connection Test Failed").format(error=connection_error)
+                    fb1_spec = get_llm_provider(fb1_provider)
+                    fb1_form_panel, fb1_help_panel = st.columns(
+                        [0.9, 1.1],
+                        gap="large",
+                        vertical_alignment="top",
                     )
+                    fb1_helper = fb1_help_panel.container()
+                    fb1_tips = get_llm_provider_tips(fb1_provider)
+                    if fb1_tips:
+                        with fb1_helper:
+                            st.info(fb1_tips)
+
+                    fb1_api_key = config.app.get("fallback_llm_api_key", "")
+                    if not fb1_api_key and fb1_spec:
+                        fb1_api_key = config.app.get(fb1_spec.config_key("api_key"), "")
+
+                    fb1_base_url = config.app.get("fallback_llm_base_url", "")
+                    if not fb1_base_url and fb1_spec:
+                        fb1_base_url = config.app.get(fb1_spec.config_key("base_url"), "") or fb1_spec.default_base_url
+
+                    fb1_model_name = config.app.get("fallback_llm_model_name", "")
+                    if not fb1_model_name and fb1_spec:
+                        fb1_model_name = config.app.get(fb1_spec.config_key("model_name"), "") or fb1_spec.default_model
+
+                    st_fb1_api_key = fb1_form_panel.text_input(
+                        "1. Yedek API Key",
+                        value=fb1_api_key,
+                        type="password",
+                        key=f"fb1_{fb1_provider}_api_key_input",
+                        placeholder="sk-... veya gsk_...",
+                    )
+                    st_fb1_base_url = ""
+                    if fb1_spec and fb1_spec.show_base_url:
+                        st_fb1_base_url = fb1_form_panel.text_input(
+                            "1. Yedek Base Url",
+                            value=fb1_base_url,
+                            key=f"fb1_{fb1_provider}_base_url_input",
+                        )
+                    st_fb1_model_name = ""
+                    if fb1_provider == "groq":
+                        eff_fb1_key = st_fb1_api_key or fb1_api_key
+                        eff_fb1_url = st_fb1_base_url or fb1_base_url
+                        groq_fb1_models = get_groq_model_ids(api_key=eff_fb1_key, base_url=eff_fb1_url)
+                        if groq_fb1_models:
+                            s_fb1_idx = groq_fb1_models.index(fb1_model_name) if fb1_model_name in groq_fb1_models else 0
+                            st_fb1_model_name = fb1_form_panel.selectbox(
+                                "1. Yedek Model Adı",
+                                options=groq_fb1_models,
+                                index=s_fb1_idx,
+                                key="groq_fb1_model_name_select",
+                            )
+                        else:
+                            st_fb1_model_name = fb1_form_panel.text_input(
+                                "1. Yedek Model Adı",
+                                value=fb1_model_name,
+                                key=f"fb1_{fb1_provider}_model_name_input",
+                                placeholder=fb1_spec.default_model if fb1_spec else "",
+                            )
+                    else:
+                        st_fb1_model_name = fb1_form_panel.text_input(
+                            "1. Yedek Model Adı",
+                            value=fb1_model_name,
+                            key=f"fb1_{fb1_provider}_model_name_input",
+                            placeholder=fb1_spec.default_model if fb1_spec else "",
+                        )
+
+                    config.app["fallback_llm_api_key"] = st_fb1_api_key.strip()
+                    config.app["fallback_llm_base_url"] = st_fb1_base_url.strip()
+                    config.app["fallback_llm_model_name"] = st_fb1_model_name.strip()
+
+                    if fb1_form_panel.button(
+                        "🔌 1. Yedek AI Bağlantısını Test Et",
+                        key="test_fb1_connection_button",
+                        use_container_width=True,
+                        type="secondary",
+                        icon=":material/network_check:",
+                    ):
+                        with fb1_form_panel.spinner("1. Yedek AI test ediliyor..."):
+                            with config.runtime_config_lock():
+                                ok_fb1, err_fb1, el_fb1 = llm.test_connection(
+                                    provider_id=fb1_provider,
+                                    api_key=st_fb1_api_key.strip() or None,
+                                    base_url=st_fb1_base_url.strip() or None,
+                                    model_name=st_fb1_model_name.strip() or None,
+                                )
+                        if ok_fb1:
+                            fb1_form_panel.success(
+                                f"✅ 1. Yedek AI Hazır: '{fb_labels.get(fb1_provider, fb1_provider)}' ({st_fb1_model_name or 'varsayılan'}) yanıt verdi ({el_fb1:.2f}s)!"
+                            )
+                        else:
+                            fb1_form_panel.error(f"❌ 1. Yedek AI Bağlantı Hatası: {err_fb1}")
+
+            # ================= TAB 3: 2. YEDEK AI (FALLBACK 2) =================
+            with tab_fb2_llm:
+                saved_fb2 = str(config.app.get("fallback2_llm_provider", "none")).lower()
+                if saved_fb2 not in fb_choices:
+                    saved_fb2 = "none"
+
+                fb2_provider = stable_selectbox(
+                    "2. Yedek AI Sağlayıcı",
+                    options=fb_choices,
+                    default_value=saved_fb2,
+                    key="llm_fallback2_provider_select",
+                    format_func=lambda pid: fb_labels.get(pid, pid),
+                )
+                config.app["fallback2_llm_provider"] = fb2_provider
+
+                if fb2_provider == "none":
+                    st.info("🛡️ 2. Yedek AI devre dışı.")
+                    config.app["fallback2_llm_api_key"] = ""
+                    config.app["fallback2_llm_model_name"] = ""
+                    config.app["fallback2_llm_base_url"] = ""
+                else:
+                    fb2_spec = get_llm_provider(fb2_provider)
+                    fb2_form_panel, fb2_help_panel = st.columns(
+                        [0.9, 1.1],
+                        gap="large",
+                        vertical_alignment="top",
+                    )
+                    fb2_helper = fb2_help_panel.container()
+                    fb2_tips = get_llm_provider_tips(fb2_provider)
+                    if fb2_tips:
+                        with fb2_helper:
+                            st.info(fb2_tips)
+
+                    fb2_api_key = config.app.get("fallback2_llm_api_key", "")
+                    if not fb2_api_key and fb2_spec:
+                        fb2_api_key = config.app.get(fb2_spec.config_key("api_key"), "")
+
+                    fb2_base_url = config.app.get("fallback2_llm_base_url", "")
+                    if not fb2_base_url and fb2_spec:
+                        fb2_base_url = config.app.get(fb2_spec.config_key("base_url"), "") or fb2_spec.default_base_url
+
+                    fb2_model_name = config.app.get("fallback2_llm_model_name", "")
+                    if not fb2_model_name and fb2_spec:
+                        fb2_model_name = config.app.get(fb2_spec.config_key("model_name"), "") or fb2_spec.default_model
+
+                    st_fb2_api_key = fb2_form_panel.text_input(
+                        "2. Yedek API Key",
+                        value=fb2_api_key,
+                        type="password",
+                        key=f"fb2_{fb2_provider}_api_key_input",
+                        placeholder="sk-... veya gsk_...",
+                    )
+                    st_fb2_base_url = ""
+                    if fb2_spec and fb2_spec.show_base_url:
+                        st_fb2_base_url = fb2_form_panel.text_input(
+                            "2. Yedek Base Url",
+                            value=fb2_base_url,
+                            key=f"fb2_{fb2_provider}_base_url_input",
+                        )
+                    st_fb2_model_name = ""
+                    if fb2_provider == "groq":
+                        eff_fb2_key = st_fb2_api_key or fb2_api_key
+                        eff_fb2_url = st_fb2_base_url or fb2_base_url
+                        groq_fb2_models = get_groq_model_ids(api_key=eff_fb2_key, base_url=eff_fb2_url)
+                        if groq_fb2_models:
+                            s_fb2_idx = groq_fb2_models.index(fb2_model_name) if fb2_model_name in groq_fb2_models else 0
+                            st_fb2_model_name = fb2_form_panel.selectbox(
+                                "2. Yedek Model Adı",
+                                options=groq_fb2_models,
+                                index=s_fb2_idx,
+                                key="groq_fb2_model_name_select",
+                            )
+                        else:
+                            st_fb2_model_name = fb2_form_panel.text_input(
+                                "2. Yedek Model Adı",
+                                value=fb2_model_name,
+                                key=f"fb2_{fb2_provider}_model_name_input",
+                                placeholder=fb2_spec.default_model if fb2_spec else "",
+                            )
+                    else:
+                        st_fb2_model_name = fb2_form_panel.text_input(
+                            "2. Yedek Model Adı",
+                            value=fb2_model_name,
+                            key=f"fb2_{fb2_provider}_model_name_input",
+                            placeholder=fb2_spec.default_model if fb2_spec else "",
+                        )
+
+                    config.app["fallback2_llm_api_key"] = st_fb2_api_key.strip()
+                    config.app["fallback2_llm_base_url"] = st_fb2_base_url.strip()
+                    config.app["fallback2_llm_model_name"] = st_fb2_model_name.strip()
+
+                    if fb2_form_panel.button(
+                        "🔌 2. Yedek AI Bağlantısını Test Et",
+                        key="test_fb2_connection_button",
+                        use_container_width=True,
+                        type="secondary",
+                        icon=":material/network_check:",
+                    ):
+                        with fb2_form_panel.spinner("2. Yedek AI test ediliyor..."):
+                            with config.runtime_config_lock():
+                                ok_fb2, err_fb2, el_fb2 = llm.test_connection(
+                                    provider_id=fb2_provider,
+                                    api_key=st_fb2_api_key.strip() or None,
+                                    base_url=st_fb2_base_url.strip() or None,
+                                    model_name=st_fb2_model_name.strip() or None,
+                                )
+                        if ok_fb2:
+                            fb2_form_panel.success(
+                                f"✅ 2. Yedek AI Hazır: '{fb_labels.get(fb2_provider, fb2_provider)}' ({st_fb2_model_name or 'varsayılan'}) yanıt verdi ({el_fb2:.2f}s)!"
+                            )
+                        else:
+                            fb2_form_panel.error(f"❌ 2. Yedek AI Bağlantı Hatası: {err_fb2}")
+
+            # ================= KESİNTİSİZ ZİNCİR ÖZETİ VE GENEL TEST =================
+            st.divider()
+            c_chain1, c_chain2 = st.columns([2.6, 1.4], vertical_alignment="center")
+            with c_chain1:
+                p1_txt = llm_provider_labels.get(llm_provider, llm_provider)
+                p2_txt = fb_labels.get(fb1_provider, fb1_provider) if fb1_provider != "none" else "Kapalı"
+                p3_txt = fb_labels.get(fb2_provider, fb2_provider) if fb2_provider != "none" else "Kapalı"
+                st.markdown(
+                    f"<div style='font-size: 13px; font-weight: 600; color: #94a3b8;'>"
+                    f"🔗 <span style='color: #fff;'>Aktif AI Zinciri:</span> "
+                    f"<span style='color: #60a5fa;'>🌟 {p1_txt}</span> ➡️ "
+                    f"<span style='color: #34d399;'>🛡️ {p2_txt}</span> ➡️ "
+                    f"<span style='color: #a78bfa;'>🛡️ {p3_txt}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with c_chain2:
+                if st.button(
+                    "⚡ Tüm Zinciri Test Et",
+                    key="test_entire_llm_chain_button",
+                    use_container_width=True,
+                    type="primary",
+                    icon=":material/bolt:",
+                    help="Ana modelden başlayıp olası hata durumunda yedekleri test eden uçtan uca zincir testi.",
+                ):
+                    with st.spinner("Tüm AI zinciri test ediliyor..."):
+                        with config.runtime_config_lock():
+                            chain_ok, chain_err, chain_el = llm.test_connection()
+                    if chain_ok:
+                        st.success(f"✅ AI Zinciri Kusursuz Çalışıyor ({chain_el:.2f}s)!")
+                    else:
+                        st.error(f"❌ Zincir Hatası: {chain_err}")
+
 
         # 右侧面板 - API 密钥设置
         with right_config_panel:
@@ -2147,7 +2468,7 @@ def _render_settings_dialog():
                         tr("Stop / Cancel Authorization"),
                         key="cancel_yt_auth_btn",
                         type="primary",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/cancel:",
                     ):
                         youtube_uploader_service.cancel_browser_auth()
@@ -2182,7 +2503,7 @@ def _render_settings_dialog():
                     btn_label,
                     key="auth_youtube_button",
                     type="primary" if (not is_authed or auth_status in ("timeout", "cancelled", "error")) else "secondary",
-                    use_container_width=True,
+                    width="stretch",
                     icon=":material/login:",
                 ):
                     if not st_yt_client_id or not st_yt_client_secret:
@@ -2286,14 +2607,14 @@ def _render_script_settings(panel, params):
                         key="restore_default_system_prompt",
                         icon=":material/restart_alt:",
                         on_click=reset_script_system_prompt,
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         st.toast(tr("Default System Prompt Restored"))
                     if preview_prompt_col.button(
                         tr("Preview Final Prompt"),
                         key="preview_final_script_prompt",
                         icon=":material/preview:",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         render_script_prompt_preview(
                             llm.build_script_prompt(
@@ -2308,7 +2629,7 @@ def _render_script_settings(panel, params):
             if st.button(
                 tr("Generate Video Script and Keywords"),
                 key="auto_generate_script",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
@@ -2349,7 +2670,7 @@ def _render_script_settings(panel, params):
             if st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
@@ -2787,14 +3108,14 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         tr("Play Voice"),
         key="play_voice_button",
         icon=":material/graphic_eq:",
-        use_container_width=True,
+        width="stretch",
     )
     full_preview_requested = preview_columns[1].button(
         tr("Generate Full Voiceover Preview"),
         key="generate_full_voiceover_preview_button",
         icon=":material/article:",
         help=tr("Full Voiceover Preview Cost Hint"),
-        use_container_width=True,
+        width="stretch",
         disabled=not bool(script_content),
     )
 
@@ -3148,7 +3469,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         if st.button(
             tr("Test Sonilo Connection"),
             key="test_sonilo_connection_button",
-            use_container_width=True,
+            width="stretch",
         ):
             try:
                 sonilo_service.test_connection()
@@ -3169,7 +3490,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         if st.button(
             tr("Test ElevenLabs Connection"),
             key="test_elevenlabs_music_connection_button",
-            use_container_width=True,
+            width="stretch",
         ):
             try:
                 elevenlabs_music_service.test_connection()
@@ -3849,7 +4170,7 @@ def _render_subtitle_settings(panel, params):
                 key="restore_default_subtitle_settings",
                 icon=":material/restart_alt:",
                 on_click=reset_subtitle_settings,
-                use_container_width=True,
+                width="stretch",
             ):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
@@ -3890,7 +4211,7 @@ def _render_generation_controls(
 
     start_button = st.button(
         tr("Generate Video"),
-        use_container_width=True,
+        width="stretch",
         type="primary",
         key="generate_video_button",
         on_click=_prepare_generation_task,
@@ -4102,8 +4423,41 @@ def _render_generation_controls(
     return start_button
 
 
+def _has_existing_configuration() -> bool:
+    """Kullanıcının config dosyasında önceden kaydedilmiş API anahtarları veya ayarları var mı?"""
+    if config.app.get("setup_completed", False):
+        return True
+    llm_keys = [
+        "groq_api_key", "openai_api_key", "gemini_api_key", "deepseek_api_key",
+        "claude_api_key", "ollama_model_name", "qwen_api_key", "moonshot_api_key"
+    ]
+    for k in llm_keys:
+        val = str(config.app.get(k, "") or "").strip()
+        if val and not val.startswith("sk-placeholder") and len(val) > 5:
+            config.app["setup_completed"] = True
+            return True
+    return False
+
+
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
+    # Sadece config ayarları hiç yoksa (sıfır kurulum) VEYA kullanıcı Ayarlar'dan bilerek tıkladıysa sihirbaz açılır
+    show_wizard = st.session_state.get("show_setup_wizard", False)
+    if show_wizard or not _has_existing_configuration():
+        from webui.views.setup_wizard import render_setup_wizard
+        render_setup_wizard()
+        return
+
+    # 🌌 Config varsa direkt siteye girerken en az 5 saniyelik şatafatlı açılış animasyonu göster
+    if not st.session_state.get("app_splash_dismissed", False):
+        from webui.views.setup_wizard import render_splash_screen
+        render_splash_screen(
+            target_session_key="app_splash_dismissed",
+            ready_message="Sistem hazır! AutoShorts Studio stüdyo paneli açılıyor...",
+            min_duration=5.0
+        )
+        return
+
     _render_top_bar()
 
     if st.session_state.get("settings_dialog_open", False):

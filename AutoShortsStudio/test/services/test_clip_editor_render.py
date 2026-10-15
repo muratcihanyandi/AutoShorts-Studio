@@ -7,14 +7,21 @@ if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
 import unittest
+import uuid
+from unittest.mock import patch
 from app.models.clip_schema import PlatformType, ClipStatus, ClipItem, ClipPipelineSettings
 from app.services.clip_editor import clip_editor
 from app.services.hype_detector import hype_detector
-from app.services.clip_db import clip_db
+from app.services.clip_db import ClipDatabase
 
 
 class TestClipEditorRender(unittest.TestCase):
     def setUp(self):
+        self.db_name = os.path.join(root_dir, "storage", f"test_render_{uuid.uuid4().hex[:8]}.db")
+        self.test_db = ClipDatabase(self.db_name)
+        self.db_patcher = patch("app.services.clip_editor.clip_db", self.test_db)
+        self.db_patcher.start()
+
         self.temp_video = os.path.join(root_dir, "storage", "clips", "raw", "test_sample_16x9.mp4")
         os.makedirs(os.path.dirname(self.temp_video), exist_ok=True)
         
@@ -32,6 +39,13 @@ class TestClipEditorRender(unittest.TestCase):
         self.assertTrue(os.path.exists(self.temp_video), f"Test video creation failed: {res.stderr}")
 
     def tearDown(self):
+        if hasattr(self, "db_patcher"):
+            self.db_patcher.stop()
+        if hasattr(self, "db_name") and os.path.exists(self.db_name):
+            try:
+                os.remove(self.db_name)
+            except Exception:
+                pass
         if os.path.exists(self.temp_video):
             try:
                 os.remove(self.temp_video)
@@ -49,7 +63,7 @@ class TestClipEditorRender(unittest.TestCase):
             raw_video_path=self.temp_video,
             status=ClipStatus.DOWNLOADED
         )
-        clip_db.save_clip(clip)
+        self.test_db.save_clip(clip)
 
         settings = ClipPipelineSettings(
             video_layout="blur_bg",
@@ -115,7 +129,7 @@ class TestClipEditorRender(unittest.TestCase):
             hook_text="Rraenee Çıldırdı 😱",
             status=ClipStatus.DOWNLOADED
         )
-        clip_db.save_clip(clip)
+        self.test_db.save_clip(clip)
 
         settings = ClipPipelineSettings(
             video_layout="streamer_facecam",
@@ -145,6 +159,41 @@ class TestClipEditorRender(unittest.TestCase):
         probe_res = subprocess.run(cmd, capture_output=True, text=True, check=True)
         self.assertEqual(probe_res.stdout.strip(), "1080x1920")
 
+        if os.path.exists(out_shorts):
+            try:
+                os.remove(out_shorts)
+            except Exception:
+                pass
+
+    def test_auto_facecam_detection(self):
+        """Otomatik webcam/facecam tespiti ve auto layout render testi."""
+        detected = clip_editor.detect_facecam_position(self.temp_video)
+        self.assertIn(detected, ["bottom_left", "bottom_right", "top_left", "top_right"])
+
+        clip = ClipItem(
+            clip_id="test_auto_facecam_render",
+            platform=PlatformType.TWITCH,
+            channel_name="streamer",
+            title="Auto Facecam Test",
+            url="https://twitch.tv/clip/123",
+            raw_video_path=self.temp_video,
+            status=ClipStatus.DOWNLOADED
+        )
+        self.test_db.save_clip(clip)
+
+        settings = ClipPipelineSettings(
+            video_layout="streamer_facecam",
+            facecam_position="auto",
+            subtitle_enabled=False
+        )
+
+        out_shorts = clip_editor.process_clip_to_shorts(
+            clip,
+            settings=settings,
+            cut_start_sec=1.0,
+            cut_end_sec=3.0
+        )
+        self.assertTrue(os.path.exists(out_shorts))
         if os.path.exists(out_shorts):
             try:
                 os.remove(out_shorts)

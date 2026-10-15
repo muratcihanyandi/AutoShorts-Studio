@@ -66,8 +66,9 @@ class HypeDetectorService:
             "-"
         ]
 
+        analysis_timeout = max(120, int(total_duration * 0.5))
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=120)
+            res = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=analysis_timeout)
             output = res.stderr
 
             time_energy: List[Tuple[float, float]] = []
@@ -82,24 +83,40 @@ class HypeDetectorService:
                 start = max(valid_start, (total_duration - target_window_sec) / 2.0)
                 return start, min(total_duration, start + target_window_sec), 0.5
 
-            # Kayan pencere (Sliding Window) ile en yuksek ortalama enerjiyi bul
+            # Kayan pencere (Two-Pointer Sliding Window - O(N))
+            # Sadece valid_start ve valid_end arasindaki ornekler uzerinde calisir (intro/outro kontaminasyonu onlenir)
+            samples = [(t, e) for t, e in time_energy if valid_start <= t <= valid_end]
+            if not samples:
+                start = max(valid_start, (total_duration - target_window_sec) / 2.0)
+                return start, min(total_duration, start + target_window_sec), 0.5
+
             best_start = valid_start
             best_avg_energy = -1.0
 
-            for i in range(len(time_energy)):
-                start_t = time_energy[i][0]
-                if start_t < valid_start:
-                    continue
+            n = len(samples)
+            right = 0
+            cur_sum = 0.0
+
+            for left in range(n):
+                start_t = samples[left][0]
                 end_t = start_t + target_window_sec
                 if end_t > valid_end:
                     break
 
-                window_energies = [e for t, e in time_energy if start_t <= t <= end_t]
-                if window_energies:
-                    avg_energy = sum(window_energies) / len(window_energies)
+                # Sag isaretciyi pencere sonuna kadar ilerlet
+                while right < n and samples[right][0] <= end_t:
+                    cur_sum += samples[right][1]
+                    right += 1
+
+                count = right - left
+                if count > 0:
+                    avg_energy = cur_sum / count
                     if avg_energy > best_avg_energy:
                         best_avg_energy = avg_energy
                         best_start = start_t
+
+                # Sol eleman pencereden cikar
+                cur_sum -= samples[left][1]
 
             best_end = min(total_duration, best_start + target_window_sec)
             normalized_score = min(1.0, max(0.0, best_avg_energy / 70.0))

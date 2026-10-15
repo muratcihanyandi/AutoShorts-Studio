@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from time import perf_counter
-from typing import List
+from typing import List, Optional, Tuple, Dict, Any
 
 from loguru import logger
 from openai import AzureOpenAI, OpenAI
@@ -139,297 +139,398 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
-    try:
-        llm_provider = str(
-            config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
-        ).lower()
-        provider = get_llm_provider(llm_provider)
-        if provider is None:
-            raise ValueError(f"{llm_provider}: unsupported llm provider")
+def _invoke_single_llm_provider(
+    llm_provider: str,
+    api_key: Optional[str] = None,
+    model_name: Optional[str] = None,
+    base_url: Optional[str] = None,
+    prompt: str = ""
+) -> str:
+    """Tek bir LLM sağlayıcısına doğrudan istek atar."""
+    provider_id_clean = str(llm_provider or DEFAULT_LLM_PROVIDER_ID).lower().strip()
+    provider = get_llm_provider(provider_id_clean)
+    if provider is None:
+        raise ValueError(f"{provider_id_clean}: unsupported llm provider")
 
-        logger.info(f"llm provider: {llm_provider}")
-        api_key = config.app.get(provider.config_key("api_key"), "")
-        configured_model = config.app.get(provider.config_key("model_name"), "")
-        model_name = provider.resolve_model_name(configured_model)
-        if configured_model and model_name != configured_model:
-            logger.warning(
-                f"{llm_provider} model '{configured_model}' is deprecated, "
-                f"fallback to '{model_name}'"
-            )
-        configured_base_url = config.app.get(provider.config_key("base_url"), "")
-        base_url = provider.resolve_base_url(configured_base_url)
-        if configured_base_url and configured_base_url.strip().rstrip("/") in {
-            url.rstrip("/") for url in provider.deprecated_base_urls
-        }:
-            logger.warning(
-                f"{llm_provider} base URL '{configured_base_url}' is deprecated, "
-                f"fallback to '{base_url}'"
-            )
-        adapter = provider.adapter
-        api_version = ""
-
-        # Ollama 的默认地址依赖当前是否运行在容器中，无法作为静态 Registry
-        # 值保存；Registry 仍负责模型和必填规则，运行环境差异在这里解析。
-        if llm_provider == "ollama":
-            api_key = "ollama"
-            if not base_url:
-                base_url = config.get_default_ollama_base_url()
-
-        if adapter == "azure":
-            api_version = config.app.get(
-                provider.config_key("api_version"), "2024-02-15-preview"
-            )
-
-        extra_values = {
-            field.config_suffix: (
-                config.app.get(provider.config_key(field.config_suffix), "")
-                or field.default_value
-            )
-            for field in provider.extra_fields
-        }
-
-        if provider.requires_api_key and not api_key:
-            raise ValueError(
-                f"{llm_provider}: api_key is not set, please set it in the config.toml file."
-            )
-        if provider.requires_model_name and not model_name:
-            raise ValueError(
-                f"{llm_provider}: model_name is not set, please set it in the config.toml file."
-            )
-        if provider.requires_base_url and not base_url:
-            raise ValueError(
-                f"{llm_provider}: base_url is not set, please set it in the config.toml file."
-            )
-
-        for field in provider.extra_fields:
-            if field.required and not extra_values[field.config_suffix]:
-                raise ValueError(
-                    f"{llm_provider}: {field.config_suffix} is not set, "
-                    "please set it in the config.toml file."
-                )
-
-        if adapter == "qwen":
-            import dashscope
-            from dashscope.api_entities.dashscope_response import GenerationResponse
-
-            dashscope.api_key = api_key
-            response = dashscope.Generation.call(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
-            )
-            if response:
-                if isinstance(response, GenerationResponse):
-                    status_code = response.status_code
-                    if status_code != 200:
-                        raise Exception(
-                            f'[{llm_provider}] returned an error response: "{response}"'
-                        )
-
-                    return _extract_qwen_generation_text(response)
-                else:
-                    raise Exception(
-                        f'[{llm_provider}] returned an invalid response: "{response}"'
-                    )
-            else:
-                raise Exception(f"[{llm_provider}] returned an empty response")
-
-        if adapter == "gemini":
-            from google import genai
-            from google.genai import types
-
-            http_options = types.HttpOptions(base_url=base_url) if base_url else None
-            generation_config = types.GenerateContentConfig(
-                temperature=0.5,
-                top_p=1,
-                top_k=1,
-                max_output_tokens=2048,
-                safety_settings=[
-                    types.SafetySetting(
-                        category="HARM_CATEGORY_HARASSMENT",
-                        threshold="BLOCK_ONLY_HIGH",
-                    ),
-                    types.SafetySetting(
-                        category="HARM_CATEGORY_HATE_SPEECH",
-                        threshold="BLOCK_ONLY_HIGH",
-                    ),
-                    types.SafetySetting(
-                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        threshold="BLOCK_ONLY_HIGH",
-                    ),
-                    types.SafetySetting(
-                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                        threshold="BLOCK_ONLY_HIGH",
-                    ),
-                ],
-            )
-
-            try:
-                # 新版 google-genai 通过统一 Client 暴露模型服务。上下文管理器
-                # 会在请求结束后关闭底层 HTTP 连接，避免频繁生成时积累连接资源。
-                with genai.Client(
-                    api_key=api_key,
-                    http_options=http_options,
-                ) as client:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=generation_config,
-                    )
-                generated_text = response.text
-            except (AttributeError, IndexError, ValueError) as e:
-                logger.warning(f"gemini returned invalid response content: {str(e)}")
-                raise ValueError(f"[{llm_provider}] returned invalid response content")
-
-            return _normalize_text_response(generated_text, llm_provider)
-
-        if adapter == "cloudflare_ai_gateway":
-            account_id = extra_values["account_id"]
-            gateway_id = extra_values["gateway_id"]
-            # Cloudflare 当前推荐的 AI Gateway REST API 兼容 OpenAI SDK。
-            # Account ID 用于构造统一端点，Gateway ID 通过请求头选择；这里
-            # 不再调用 Workers AI 的 /ai/run/{model} 专用接口。
-            client = OpenAI(
-                api_key=api_key,
-                base_url=(
-                    f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
-                ),
-                default_headers={"cf-aig-gateway-id": gateway_id},
-            )
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return _extract_chat_completion_text(response, llm_provider)
-
-        if adapter == "litellm":
-            import litellm
-
-            if not model_name:
-                raise ValueError(
-                    f"{llm_provider}: model_name is not set, please set it in the config.toml file."
-                )
-
-            response = litellm.completion(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                drop_params=True,
-            )
-
-            if not response:
-                raise ValueError(f"[{llm_provider}] returned empty response")
-            if not getattr(response, "choices", None):
-                raise ValueError(f"[{llm_provider}] returned empty response")
-
-            return _extract_chat_completion_text(response, llm_provider)
-
-        if adapter == "azure":
-            # Azure OpenAI SDK 使用 `azure_endpoint` 和 `api_version` 生成专用请求地址，
-            # 不能继续复用下面普通 OpenAI-compatible 的 `base_url` 初始化逻辑。
-            # 这里在 Azure 分支内完成请求并立即返回，避免客户端被后续 fallback
-            # 覆盖，导致用户配置的 Azure 凭证通过校验但实际请求没有被使用。
-            logger.info(f"requesting azure chat completion, model: {model_name}")
-            client = AzureOpenAI(
-                api_key=api_key,
-                api_version=api_version,
-                azure_endpoint=base_url,
-            )
-            response = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
-            )
-            if response:
-                if isinstance(response, ChatCompletion):
-                    return _extract_chat_completion_text(response, llm_provider)
-                else:
-                    raise Exception(
-                        f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
-                        f"connection and try again."
-                    )
-            else:
-                raise Exception(
-                    f"[{llm_provider}] returned an empty response, please check your network connection and try again."
-                )
-
-        if adapter == "modelscope":
-            content = ""
-            client = OpenAI(
-                api_key=api_key,
-                base_url=base_url,
-            )
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                extra_body={"enable_thinking": False},
-                stream=True,
-            )
-            if response:
-                for chunk in response:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    if delta and delta.content:
-                        content += delta.content
-
-                if not content.strip():
-                    raise ValueError("Empty content in stream response")
-
-                return _normalize_text_response(content, llm_provider)
-            else:
-                raise Exception(f"[{llm_provider}] returned an empty response")
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
+    resolved_api_key = api_key if (api_key is not None and api_key != "") else config.app.get(provider.config_key("api_key"), "")
+    configured_model = model_name if (model_name is not None and model_name != "") else config.app.get(provider.config_key("model_name"), "")
+    resolved_model = provider.resolve_model_name(configured_model)
+    if configured_model and resolved_model != configured_model:
+        logger.warning(
+            f"{provider_id_clean} model '{configured_model}' is deprecated, fallback to '{resolved_model}'"
         )
 
-        response = client.chat.completions.create(
-            model=model_name, messages=[{"role": "user", "content": prompt}]
+    configured_base_url = base_url if (base_url is not None and base_url != "") else config.app.get(provider.config_key("base_url"), "")
+    resolved_base_url = provider.resolve_base_url(configured_base_url)
+    if configured_base_url and configured_base_url.strip().rstrip("/") in {
+        url.rstrip("/") for url in provider.deprecated_base_urls
+    }:
+        logger.warning(
+            f"{provider_id_clean} base URL '{configured_base_url}' is deprecated, fallback to '{resolved_base_url}'"
+        )
+
+    adapter = provider.adapter
+    api_version = ""
+
+    if provider_id_clean == "ollama":
+        resolved_api_key = "ollama"
+        if not resolved_base_url:
+            resolved_base_url = config.get_default_ollama_base_url()
+
+    if adapter == "azure":
+        api_version = config.app.get(
+            provider.config_key("api_version"), "2024-02-15-preview"
+        )
+
+    extra_values = {
+        field.config_suffix: (
+            config.app.get(provider.config_key(field.config_suffix), "")
+            or field.default_value
+        )
+        for field in provider.extra_fields
+    }
+
+    if provider.requires_api_key and not resolved_api_key:
+        raise ValueError(
+            f"{provider_id_clean}: api_key is not set, please set it in the config or UI."
+        )
+    if provider.requires_model_name and not resolved_model:
+        raise ValueError(
+            f"{provider_id_clean}: model_name is not set, please set it in the config or UI."
+        )
+    if provider.requires_base_url and not resolved_base_url:
+        raise ValueError(
+            f"{provider_id_clean}: base_url is not set, please set it in the config or UI."
+        )
+
+    for field in provider.extra_fields:
+        if field.required and not extra_values[field.config_suffix]:
+            raise ValueError(
+                f"{provider_id_clean}: {field.config_suffix} is not set, please set it in the config."
+            )
+
+    if adapter == "qwen":
+        import dashscope
+        from dashscope.api_entities.dashscope_response import GenerationResponse
+
+        dashscope.api_key = resolved_api_key
+        response = dashscope.Generation.call(
+            model=resolved_model, messages=[{"role": "user", "content": prompt}]
         )
         if response:
-            if isinstance(response, ChatCompletion):
-                return _extract_chat_completion_text(response, llm_provider)
+            if isinstance(response, GenerationResponse):
+                status_code = response.status_code
+                if status_code != 200:
+                    raise Exception(
+                        f'[{provider_id_clean}] returned an error response: "{response}"'
+                    )
+                return _extract_qwen_generation_text(response)
             else:
                 raise Exception(
-                    f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
-                    f"connection and try again."
+                    f'[{provider_id_clean}] returned an invalid response: "{response}"'
                 )
         else:
-            raise Exception(
-                f"[{llm_provider}] returned an empty response, please check your network connection and try again."
+            raise Exception(f"[{provider_id_clean}] returned an empty response")
+
+    if adapter == "gemini":
+        from google import genai
+        from google.genai import types
+
+        http_options = types.HttpOptions(base_url=resolved_base_url) if resolved_base_url else None
+        generation_config = types.GenerateContentConfig(
+            temperature=0.5,
+            top_p=1,
+            top_k=1,
+            max_output_tokens=2048,
+            safety_settings=[
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="BLOCK_ONLY_HIGH",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH",
+                    threshold="BLOCK_ONLY_HIGH",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="BLOCK_ONLY_HIGH",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_ONLY_HIGH",
+                ),
+            ],
+        )
+
+        try:
+            with genai.Client(
+                api_key=resolved_api_key,
+                http_options=http_options,
+            ) as client:
+                response = client.models.generate_content(
+                    model=resolved_model,
+                    contents=prompt,
+                    config=generation_config,
+                )
+            generated_text = response.text
+        except (AttributeError, IndexError, ValueError) as e:
+            logger.warning(f"gemini returned invalid response content: {str(e)}")
+            raise ValueError(f"[{provider_id_clean}] returned invalid response content")
+
+        return _normalize_text_response(generated_text, provider_id_clean)
+
+    if adapter == "cloudflare_ai_gateway":
+        account_id = extra_values["account_id"]
+        gateway_id = extra_values["gateway_id"]
+        client = OpenAI(
+            api_key=resolved_api_key,
+            base_url=(
+                f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+            ),
+            default_headers={"cf-aig-gateway-id": gateway_id},
+        )
+        response = client.chat.completions.create(
+            model=resolved_model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return _extract_chat_completion_text(response, provider_id_clean)
+
+    if adapter == "litellm":
+        import litellm
+
+        if not resolved_model:
+            raise ValueError(
+                f"{provider_id_clean}: model_name is not set, please set it in the config or UI."
             )
 
-    except Exception as e:
-        raise LLMGenerationError(_sanitize_error_message(e)) from e
+        response = litellm.completion(
+            model=resolved_model,
+            messages=[{"role": "user", "content": prompt}],
+            drop_params=True,
+        )
+
+        if not response or not getattr(response, "choices", None):
+            raise ValueError(f"[{provider_id_clean}] returned empty response")
+
+        return _extract_chat_completion_text(response, provider_id_clean)
+
+    if adapter == "azure":
+        logger.info(f"requesting azure chat completion, model: {resolved_model}")
+        client = AzureOpenAI(
+            api_key=resolved_api_key,
+            api_version=api_version,
+            azure_endpoint=resolved_base_url,
+        )
+        response = client.chat.completions.create(
+            model=resolved_model, messages=[{"role": "user", "content": prompt}]
+        )
+        if response and isinstance(response, ChatCompletion):
+            return _extract_chat_completion_text(response, provider_id_clean)
+        else:
+            raise Exception(f'[{provider_id_clean}] returned invalid response from Azure')
+
+    if adapter == "modelscope":
+        content = ""
+        client = OpenAI(
+            api_key=resolved_api_key,
+            base_url=resolved_base_url,
+        )
+        response = client.chat.completions.create(
+            model=resolved_model,
+            messages=[{"role": "user", "content": prompt}],
+            extra_body={"enable_thinking": False},
+            stream=True,
+        )
+        if response:
+            for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    content += delta.content
+
+            if not content.strip():
+                raise ValueError("Empty content in stream response")
+            return _normalize_text_response(content, provider_id_clean)
+        else:
+            raise Exception(f"[{provider_id_clean}] returned an empty response")
+
+    # Standart OpenAI Compatible (OpenAI, Groq, DeepSeek, Ollama, Moonshot vb.)
+    client = OpenAI(
+        api_key=resolved_api_key,
+        base_url=resolved_base_url,
+    )
+    response = client.chat.completions.create(
+        model=resolved_model, messages=[{"role": "user", "content": prompt}]
+    )
+    if response and isinstance(response, ChatCompletion):
+        return _extract_chat_completion_text(response, provider_id_clean)
+    else:
+        raise Exception(f'[{provider_id_clean}] returned an invalid response')
 
 
-def test_connection() -> tuple[bool, str, float]:
+def get_configured_llm_chain() -> list[dict]:
     """
-    使用当前 Provider 配置发起一次最小请求，验证实际生成链路是否可用。
+    Kullanıcının tanımladığı LLM hiyerarşisini (Main, Fallback 1, Fallback 2) sırayla döndürür.
+    """
+    chain = []
 
-    连接测试直接复用 `_generate_response()`，因此会覆盖 API Key、Base URL、
-    模型名称和 Provider 专用字段，但不会进入脚本生成的重试逻辑，也不会发送
-    用户的视频主题或文案。返回值依次为成功状态、错误信息和请求耗时。
+    # 1. Main LLM
+    main_provider = str(config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)).lower().strip()
+    if main_provider:
+        spec = get_llm_provider(main_provider)
+        key = config.app.get(spec.config_key("api_key"), "") if spec else ""
+        model = config.app.get(spec.config_key("model_name"), "") if spec else ""
+        url = config.app.get(spec.config_key("base_url"), "") if spec else ""
+        chain.append({
+            "tier": "main",
+            "label": "Ana AI (Main LLM)",
+            "provider": main_provider,
+            "api_key": key,
+            "model_name": model,
+            "base_url": url
+        })
+
+    # 2. Fallback 1 LLM
+    fb1_provider = str(config.app.get("fallback_llm_provider", "")).lower().strip()
+    if fb1_provider and fb1_provider not in ("none", "disabled", "devre_disi", "devre dışı", ""):
+        fb1_key = config.app.get("fallback_llm_api_key", "")
+        spec1 = get_llm_provider(fb1_provider)
+        if not fb1_key and spec1:
+            fb1_key = config.app.get(spec1.config_key("api_key"), "")
+        fb1_model = config.app.get("fallback_llm_model_name", "")
+        if not fb1_model and spec1:
+            fb1_model = config.app.get(spec1.config_key("model_name"), "")
+        fb1_url = config.app.get("fallback_llm_base_url", "")
+        if not fb1_url and spec1:
+            fb1_url = config.app.get(spec1.config_key("base_url"), "")
+        chain.append({
+            "tier": "fallback_1",
+            "label": "1. Yedek AI (Fallback 1)",
+            "provider": fb1_provider,
+            "api_key": fb1_key,
+            "model_name": fb1_model,
+            "base_url": fb1_url
+        })
+
+    # 3. Fallback 2 LLM
+    fb2_provider = str(config.app.get("fallback2_llm_provider", "")).lower().strip()
+    if fb2_provider and fb2_provider not in ("none", "disabled", "devre_disi", "devre dışı", ""):
+        fb2_key = config.app.get("fallback2_llm_api_key", "")
+        spec2 = get_llm_provider(fb2_provider)
+        if not fb2_key and spec2:
+            fb2_key = config.app.get(spec2.config_key("api_key"), "")
+        fb2_model = config.app.get("fallback2_llm_model_name", "")
+        if not fb2_model and spec2:
+            fb2_model = config.app.get(spec2.config_key("model_name"), "")
+        fb2_url = config.app.get("fallback2_llm_base_url", "")
+        if not fb2_url and spec2:
+            fb2_url = config.app.get(spec2.config_key("base_url"), "")
+        chain.append({
+            "tier": "fallback_2",
+            "label": "2. Yedek AI (Fallback 2)",
+            "provider": fb2_provider,
+            "api_key": fb2_key,
+            "model_name": fb2_model,
+            "base_url": fb2_url
+        })
+
+    return chain
+
+
+def _generate_response(prompt: str) -> str:
+    """
+    Main LLM -> Fallback 1 -> Fallback 2 zincirini calistirir.
+    Hata veya kota asiminda (429 vb.) bir sonraki saglayiciya otomatik gecer.
+    """
+    chain = get_configured_llm_chain()
+    if not chain:
+        raise LLMGenerationError("No LLM provider configured.")
+
+    attempt_errors = []
+    for idx, slot in enumerate(chain):
+        tier_label = slot["label"]
+        provider_id = slot["provider"]
+        try:
+            logger.info(f"[{tier_label}] Requesting completion from '{provider_id}' (model: '{slot['model_name'] or 'default'}')...")
+            resp = _invoke_single_llm_provider(
+                llm_provider=provider_id,
+                api_key=slot["api_key"] or None,
+                model_name=slot["model_name"] or None,
+                base_url=slot["base_url"] or None,
+                prompt=prompt
+            )
+            if resp:
+                if idx > 0:
+                    logger.success(f"[{tier_label}] Fallback successful using '{provider_id}' after previous tier failed!")
+                return resp
+            raise ValueError(f"Empty response received from {provider_id}")
+        except Exception as e:
+            sanitized_err = _sanitize_error_message(e)
+            logger.warning(f"[{tier_label}] '{provider_id}' call failed: {sanitized_err}")
+            attempt_errors.append(f"{tier_label} ({provider_id}): {sanitized_err}")
+            if idx < len(chain) - 1:
+                next_slot = chain[idx + 1]
+                logger.info(f"Failing over to {next_slot['label']} ('{next_slot['provider']}')...")
+
+    final_err = " | ".join(attempt_errors)
+    logger.error(f"All configured LLM providers in fallback chain failed: {final_err}")
+    raise LLMGenerationError(f"All configured LLM providers failed: {final_err}")
+
+
+def test_connection(
+    provider_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> tuple[bool, str, float]:
+    """
+    LLM bağlantısını test eder. Belirli parametreler verilirse o sağlayıcıyı;
+    boş verilirse varsayılan zincir/ana modeli test eder.
     """
     started_at = perf_counter()
-    try:
-        response = _generate_response(prompt="Reply with exactly: OK")
-    except LLMGenerationError as e:
+    if not provider_id and not api_key and not model_name and not base_url:
+        try:
+            response = _generate_response(prompt="Reply with exactly: OK")
+        except LLMGenerationError as e:
+            elapsed = perf_counter() - started_at
+            logger.warning(f"llm connection test failed: {e}")
+            return False, str(e), elapsed
+
         elapsed = perf_counter() - started_at
-        logger.warning(f"llm connection test failed: {e}")
-        return False, str(e), elapsed
+        if not response:
+            error_message = "LLM returned an empty response"
+            logger.warning(f"llm connection test failed: {error_message}")
+            return False, error_message, elapsed
+        if response.startswith("Error:"):
+            err = response.replace("Error:", "").strip()
+            logger.warning(f"llm connection test failed: {err}")
+            return False, err, elapsed
+        logger.info(f"llm connection test succeeded, elapsed: {elapsed:.2f}s")
+        return True, "", elapsed
+
+    target_provider = (provider_id or config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)).lower().strip()
+    try:
+        response = _invoke_single_llm_provider(
+            llm_provider=target_provider,
+            api_key=api_key,
+            model_name=model_name,
+            base_url=base_url,
+            prompt="Reply with exactly: OK"
+        )
+    except Exception as e:
+        elapsed = perf_counter() - started_at
+        err = _sanitize_error_message(e)
+        logger.warning(f"llm connection test failed for {target_provider}: {err}")
+        return False, str(err), elapsed
 
     elapsed = perf_counter() - started_at
-
     if not response:
-        error_message = "LLM returned an empty response"
-        logger.warning(f"llm connection test failed: {error_message}")
-        return False, error_message, elapsed
-
+        return False, "LLM returned an empty response", elapsed
     if response.startswith("Error:"):
-        err = response.replace("Error:", "").strip()
-        logger.warning(f"llm connection test failed: {err}")
-        return False, err, elapsed
+        return False, response.replace("Error:", "").strip(), elapsed
 
-    logger.info(f"llm connection test succeeded, elapsed: {elapsed:.2f}s")
+    logger.info(f"llm connection test succeeded for {target_provider}, elapsed: {elapsed:.2f}s")
     return True, "", elapsed
 
 

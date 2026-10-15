@@ -98,13 +98,17 @@ class ClipItem(BaseModel):
     youtube_video_id: Optional[str] = None
     youtube_status: Optional[str] = None
     youtube_category_id: Optional[str] = None
-    made_for_kids: bool = False
-    age_restricted: bool = False
+    made_for_kids: Optional[bool] = False
+    age_restricted: Optional[bool] = False
+    has_paid_promotion: Optional[bool] = False
+    contains_synthetic_media: Optional[bool] = False
     custom_thumbnail_path: Optional[str] = None
     scheduled_publish_time: Optional[datetime] = None
     published_at: Optional[datetime] = None
 
     error_message: Optional[str] = None
+    is_vertical: Optional[bool] = None
+    has_subtitles: Optional[bool] = None
     created_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
     updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
 
@@ -115,14 +119,15 @@ class ClipPipelineSettings(BaseModel):
     privacy_status: str = "private"  # private, unlisted, public
 
     # Gunluk yukleme kontenjanlari
-    daily_shorts_limit: int = 3
-    daily_horizontal_limit: int = 3
-    publish_interval_minutes: int = 30
+    daily_shorts_limit: int = Field(default=3, ge=1)
+    daily_horizontal_limit: int = Field(default=3, ge=1)
+    publish_interval_minutes: int = Field(default=30, ge=1)
     publish_window_start_hour: int = 9   # yerel saat
     publish_window_end_hour: int = 24    # yerel saat
 
     # Prime Time & Akilli Yayinlama
     prime_time_slots: str = "18:00, 20:00, 22:00"  # En yuksek etkilesim saatleri (Slot 1, Slot 2, Slot 3)
+    enforce_prime_time: bool = True                # Yalnizca Prime Time slotlarinda mi yayinlansin?
 
     # Hedef Stok Yonetimi (Yatay: 3, Shorts: 6)
     target_stock_horizontal: int = 3
@@ -134,10 +139,14 @@ class ClipPipelineSettings(BaseModel):
     youtube_category_id: str = "20"         # 20: Gaming, 22: People & Blogs, 24: Entertainment
     made_for_kids: bool = False             # Cocuklara ozel icerik mi?
     age_restricted: bool = False            # 18+ yas siniri
+    has_paid_promotion: bool = False        # Ucretli tanitim / urun yerlestirme var mi? (Varsayilan Hayir)
+    contains_synthetic_media: bool = False  # Degistirilmis veya yapay zeka icerik var mi? (Varsayilan Hayir)
     auto_generate_thumbnail: bool = True    # Peak hype karelerinden otomatik kapak gorseli uret
 
-    # Shorts kurgusu & OpenShorts Modeli
-    video_layout: str = "streamer_facecam"    # streamer_facecam, blur_bg, center_crop, split
+    shorts_source_mode: str = "smart_hybrid"  # smart_hybrid (dikey bulursa korur, yataysa facecam+oyun kurgular), only_native_shorts (sadece hazir dikey), convert_horizontal (sadece yataydan kurgula)
+    video_layout: str = "streamer_facecam"    # streamer_facecam (webcam ustte, oyun altta), center_crop, split
+    facecam_position: str = "auto"            # auto (otomatik algila), bottom_left, bottom_right, top_left, top_right
+    skip_subtitles_if_detected: bool = True   # Videoda onceden altyazi varsa cift altyazi yapmamak icin whisper'i atla
     hook_overlay_enabled: bool = True
     hook_position: str = "top"                # top, middle
     llm_moment_detection: bool = True
@@ -152,13 +161,15 @@ class ClipPipelineSettings(BaseModel):
     # Yatay (16:9) hatti
     horizontal_max_part_minutes: float = 15
     vod_max_minutes: int = 180
+    filter_horizontal_reactions_only: bool = True  # Yatay videolarda duz funny moments/derlemeleri ele, sadece yayincinin izledigi/tepki verdigi anlari kabul et
 
     # YouTube kaynak aramasi & Guncellik / Viral Filtresi
     youtube_search_enabled: bool = True
     youtube_source_max_minutes: int = 30
     youtube_query_suffix: str = "kesitleri klipleri"
+    enable_viral_hunter: bool = False           # Eski viral videolari avlama (Kapali: yalnizca son max_video_age_days gunun videolari secilir)
     max_video_age_days: int = 7                 # Son 7 gun (1 hafta) icindeki guncel videolar
-    viral_threshold_for_older: int = 50000      # 7 gunden eskiyse yalnizca bu izlenmenin ustundeyse al
+    viral_threshold_for_older: int = 50000      # Viral avi acikken bu izlenmenin ustundeki eski videolari kabul et
     title_blacklist: str = "açıklama, sorun, duyuru, bilgilendirme, özür, yayın saat, kickte sorun, kick'te sorun"
     enable_kick_discovery: bool = False         # Kick klipleri varsayilan kapali (bos/sacma klipleri engellemek icin)
     enable_twitch_discovery: bool = True
@@ -166,6 +177,15 @@ class ClipPipelineSettings(BaseModel):
     # Kurgu: Intro / Outro otomatik kirpma (jenerik ve bitis kartlarini keser)
     intro_trim_seconds: float = 5.0             # Videonun basindan kirpilacak intro suresi
     outro_trim_seconds: float = 6.0             # Videonun sonundan kirpilacak outro suresi
+
+    # Bant genisligi & Indirme Hiz Limiti (Internetin yavaslamamasi icin)
+    download_rate_limit_mb: float = 0.0         # 0.0 = Limitsiz (Maksimum hiz), ornegin 5.0 -> 5 MB/s ile sinirla
+
+    # AI Baslik, Aciklama ve SEO Promptu (Kullanici tarafindan ozellestirilebilir)
+    ai_seo_system_prompt: str = ""
+
+    # Taslak Olarak Onceden Yukleme (Zamani geldiginde aninda herkese acik yapilir)
+    pre_upload_as_draft: bool = True
 
     ai_title_generation: bool = True
     check_interval_minutes: int = 60

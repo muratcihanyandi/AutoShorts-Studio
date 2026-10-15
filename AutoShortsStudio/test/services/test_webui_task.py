@@ -4,9 +4,17 @@ import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
+import unittest
 from unittest.mock import patch
 
-import pytest
+try:
+    import pytest
+except ImportError:
+    pytest = None
+
+if pytest is None:
+    raise unittest.SkipTest("pytest is not installed in the current environment")
+
 from loguru import logger
 
 from app.models import const

@@ -17,6 +17,7 @@ from app.services.clip_db import ClipDatabase
 from app.services.clip_scheduler import clip_scheduler
 from app.services.clip_downloader import clip_downloader
 from app.services.shorts_publisher import shorts_publisher
+from app.services.clip_publisher import clip_publisher
 from app.services import clip_editor
 
 
@@ -161,7 +162,7 @@ class TestSchedulerFlow(unittest.TestCase):
         )
         self.db.save_clip(ready_clip)
 
-        def fake_download(clip):
+        def fake_download(clip, *args, **kwargs):
             raw = self._make_file(os.path.join(self.raw_dir, f"{clip.source_key}.mp4"))
             clip.raw_video_path = raw
             self.db.update_clip_status(clip.clip_id, ClipStatus.DOWNLOADED, raw_video_path=raw)
@@ -177,7 +178,9 @@ class TestSchedulerFlow(unittest.TestCase):
         # 1. Asama: stok isleme
         with patch.object(clip_downloader, "download_clip", side_effect=fake_download), \
              patch.object(clip_editor.clip_editor, "process_clip_to_shorts", side_effect=fake_process_shorts), \
-             patch("app.services.clip_scheduler.hype_detector.analyze_audio_volume_peaks", return_value=(5.0, 25.0, 0.9)):
+             patch("app.services.clip_scheduler.hype_detector.analyze_audio_volume_peaks", return_value=(5.0, 25.0, 0.9)), \
+             patch("app.services.shorts_publisher.upload_to_youtube", return_value={"id": "test_vid_123"}), \
+             patch("app.services.youtube_uploader.youtube_uploader_service.update_video_privacy", return_value={"success": True, "video_id": "test_vid_123"}):
             clip_scheduler._process_stock(settings)
 
         processed = self.db.get_clip_by_id("flow_pending")
@@ -186,7 +189,9 @@ class TestSchedulerFlow(unittest.TestCase):
 
         # 2. Asama: kotali yayinlama (tick) - en yuksek hype'li pending yuklenmeli
         with patch.object(shorts_publisher, "is_youtube_ready", return_value=True), \
-             patch("app.services.shorts_publisher.upload_to_youtube", return_value={"id": "test_vid_123"}):
+             patch.object(clip_publisher, "is_prime_time_now", return_value=(True, "18:00")), \
+             patch("app.services.shorts_publisher.upload_to_youtube", return_value={"id": "test_vid_123"}), \
+             patch("app.services.youtube_uploader.youtube_uploader_service.update_video_privacy", return_value={"success": True, "video_id": "test_vid_123"}):
             clip_scheduler._publish_tick(settings)
 
         published = self.db.get_clip_by_id("flow_pending")
@@ -197,6 +202,7 @@ class TestSchedulerFlow(unittest.TestCase):
 
         # Kota doldu: ikinci tick hicbir sey yuklememeli
         with patch.object(shorts_publisher, "is_youtube_ready", return_value=True), \
+             patch.object(clip_publisher, "is_prime_time_now", return_value=(True, "18:00")), \
              patch("app.services.shorts_publisher.upload_to_youtube", return_value={"id": "should_not_happen"}) as mock_up:
             clip_scheduler._publish_tick(settings)
             mock_up.assert_not_called()

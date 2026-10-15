@@ -16,6 +16,7 @@ class VideoProgressTrackerService:
         self._lock = threading.Lock()
         self._active_task: Optional[Dict[str, Any]] = None
         self._recent_completed: List[Dict[str, Any]] = []
+        self._change_counter: int = 0
 
     def start_task(
         self,
@@ -139,7 +140,8 @@ class VideoProgressTrackerService:
                     self._recent_completed.pop()
 
                 self._active_task = None
-                logger.debug(f"[ProgressTracker] Task finished: {clip_id} (success={success})")
+                self._change_counter += 1
+                logger.debug(f"[ProgressTracker] Task finished: {clip_id} (success={success}, counter={self._change_counter})")
 
     def get_active_task(self) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -158,6 +160,10 @@ class VideoProgressTrackerService:
     def is_busy(self) -> bool:
         with self._lock:
             return self._active_task is not None
+
+    def get_change_counter(self) -> int:
+        with self._lock:
+            return self._change_counter
 
 
 # Singleton ornek

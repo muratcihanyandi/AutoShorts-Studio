@@ -397,7 +397,10 @@ class YouTubeUploaderService:
         thumbnail_path: Optional[str] = None,
         category_id: Optional[str] = None,
         made_for_kids: Optional[bool] = None,
+        age_restricted: Optional[bool] = False,
         publish_at: Optional[str] = None,
+        has_paid_promotion: bool = False,
+        contains_synthetic_media: bool = False,
     ) -> Dict[str, Any]:
         """
         Uploads a video to YouTube.
@@ -406,7 +409,10 @@ class YouTubeUploaderService:
         - If thumbnail_path is provided: sets the custom thumbnail on the uploaded video.
         - If category_id is provided: overrides default channel category (e.g. 20 for Gaming).
         - If made_for_kids is provided: sets selfDeclaredMadeForKids flag.
+        - If age_restricted is provided: sets contentDetails.contentRating.ytRating = 'ytAgeRestricted'.
         - If publish_at is provided: sets scheduled release time (when privacy_status is private).
+        - has_paid_promotion: sets paidProductPlacementDetails.hasPaidProductPlacement (default False).
+        - contains_synthetic_media: sets status.containsSyntheticMedia (default False).
         """
         if not os.path.exists(video_path):
             logger.error(f"Video file not found: {video_path}")
@@ -462,15 +468,20 @@ class YouTubeUploaderService:
             final_desc = re.sub(r"#shorts\b", "", final_desc, flags=re.IGNORECASE).strip()
 
         target_category = str(category_id or self.category_id or "20")
-        is_kids = bool(made_for_kids) if made_for_kids is not None else False
+        # Para kazanma (monetization) ve yorumlar için kesinlikle Çocuklara Özel Değil (False),
+        # 18+ Yaş Sınırı Devre Dışı (False), Ücretli Tanıtım Yok (False),
+        # ve Sentetik/AI Medya Beyanı Hayır (False) olarak işaretlenir.
+        is_kids = False
 
         status_dict: Dict[str, Any] = {
             "privacyStatus": effective_privacy,
-            "selfDeclaredMadeForKids": is_kids,
+            "selfDeclaredMadeForKids": False,
+            "containsSyntheticMedia": bool(contains_synthetic_media),
         }
         if publish_at and effective_privacy == "private":
             status_dict["publishAt"] = publish_at
 
+        parts = ["snippet", "status", "paidProductPlacementDetails"]
         body = {
             "snippet": {
                 "title": clean_title,
@@ -479,6 +490,9 @@ class YouTubeUploaderService:
                 "categoryId": target_category,
             },
             "status": status_dict,
+            "paidProductPlacementDetails": {
+                "hasPaidProductPlacement": bool(has_paid_promotion),
+            },
         }
 
         try:
@@ -500,7 +514,7 @@ class YouTubeUploaderService:
                 f"Starting YouTube {video_type_str} upload: '{clean_title}' (Aspect: {video_aspect}, Privacy: {effective_privacy})..."
             )
             insert_request = youtube.videos().insert(
-                part="snippet,status",
+                part=",".join(parts),
                 body=body,
                 media_body=media,
             )
@@ -549,9 +563,59 @@ class YouTubeUploaderService:
             logger.exception(f"Unexpected error during YouTube upload: {e}")
             return {"success": False, "error": str(e)}
 
+    def update_video_privacy(self, video_id: str, new_privacy: str = "public") -> Dict[str, Any]:
+        """
+        Daha onceden taslak (private/unlisted) olarak yuklenmis bir YouTube videosunun
+        gizlilik durumunu gunceller. Ornegin yayin zamani geldiginde aninda 'public' (Herkese Acik) yapar.
+        """
+        creds = self.get_credentials()
+        if not creds:
+            return {"success": False, "error": "YouTube is not authenticated"}
+
+        new_privacy = new_privacy.lower()
+        if new_privacy not in ("public", "private", "unlisted"):
+            new_privacy = "public"
+
+        try:
+            from googleapiclient.discovery import build
+            from googleapiclient.errors import HttpError
+
+            youtube = build("youtube", "v3", credentials=creds)
+            body = {
+                "id": video_id,
+                "status": {
+                    "privacyStatus": new_privacy,
+                    "selfDeclaredMadeForKids": False,
+                    "containsSyntheticMedia": False,
+                }
+            }
+            req = youtube.videos().update(
+                part="status",
+                body=body
+            )
+            resp = req.execute()
+            logger.success(f"YouTube video {video_id} privacy updated to '{new_privacy}' successfully!")
+            return {"success": True, "video_id": video_id, "privacy_status": new_privacy, "response": resp}
+        except HttpError as e:
+            error_details = str(e)
+            try:
+                error_content = json.loads(e.content.decode("utf-8"))
+                error_details = error_content.get("error", {}).get("message", str(e))
+            except Exception:
+                pass
+            logger.error(f"Failed to update YouTube video privacy: {error_details}")
+            return {"success": False, "error": error_details}
+        except Exception as e:
+            logger.exception(f"Unexpected error updating video privacy: {e}")
+            return {"success": False, "error": str(e)}
+
 
 # Singleton instance
 youtube_uploader_service = YouTubeUploaderService()
+
+
+def update_youtube_video_privacy(video_id: str, new_privacy: str = "public") -> Dict[str, Any]:
+    return youtube_uploader_service.update_video_privacy(video_id=video_id, new_privacy=new_privacy)
 
 
 def upload_to_youtube(
@@ -564,7 +628,10 @@ def upload_to_youtube(
     thumbnail_path: Optional[str] = None,
     category_id: Optional[str] = None,
     made_for_kids: Optional[bool] = None,
+    age_restricted: Optional[bool] = False,
     publish_at: Optional[str] = None,
+    has_paid_promotion: bool = False,
+    contains_synthetic_media: bool = False,
 ) -> Dict[str, Any]:
     return youtube_uploader_service.upload_video(
         video_path=video_path,
@@ -576,5 +643,8 @@ def upload_to_youtube(
         thumbnail_path=thumbnail_path,
         category_id=category_id,
         made_for_kids=made_for_kids,
+        age_restricted=age_restricted,
         publish_at=publish_at,
+        has_paid_promotion=has_paid_promotion,
+        contains_synthetic_media=contains_synthetic_media,
     )

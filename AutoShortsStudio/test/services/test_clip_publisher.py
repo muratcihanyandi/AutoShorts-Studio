@@ -54,7 +54,7 @@ class TestClipPublisherQuota(unittest.TestCase):
         self.assertIn("reason", result["skipped"])
 
     def test_run_publish_tick_publishes_per_format(self):
-        """Kota musait oldugunda her format icin birer video yuklenmeli."""
+        """Kota musait ve Prime Time icindeyken her format icin birer video yuklenmeli."""
         settings = ClipPipelineSettings(
             auto_upload=True,
             daily_shorts_limit=3,
@@ -63,6 +63,7 @@ class TestClipPublisherQuota(unittest.TestCase):
         fake_info = {"clip_id": "x", "title": "t", "youtube_video_id": "vid123"}
 
         with patch.object(clip_publisher, "is_within_publish_window", return_value=True), \
+             patch.object(clip_publisher, "is_prime_time_now", return_value=(True, "18:00")), \
              patch.object(clip_publisher, "published_today", return_value=0), \
              patch.object(clip_publisher, "publish_next_ready", return_value=fake_info) as mock_publish:
             result = clip_publisher.run_publish_tick(settings)
@@ -72,17 +73,59 @@ class TestClipPublisherQuota(unittest.TestCase):
         formats_called = {call.args[0] for call in mock_publish.call_args_list}
         self.assertEqual(formats_called, {ClipTargetFormat.SHORTS, ClipTargetFormat.HORIZONTAL})
 
+    def test_run_publish_tick_blocked_outside_prime_time(self):
+        """Prime Time disindaysak yayinlama yapilmamali (S1 dogrulamasi)."""
+        settings = ClipPipelineSettings(
+            auto_upload=True,
+            enforce_prime_time=True,
+            prime_time_slots="18:00, 20:00, 22:00",
+        )
+        with patch.object(clip_publisher, "is_within_publish_window", return_value=True), \
+             patch.object(clip_publisher, "is_prime_time_now", return_value=(False, None)), \
+             patch.object(clip_publisher, "publish_next_ready") as mock_publish:
+            result = clip_publisher.run_publish_tick(settings)
+
+        self.assertEqual(result["published"], [])
+        self.assertIn("reason", result["skipped"])
+        self.assertIn("Prime Time disinda", result["skipped"]["reason"])
+        self.assertEqual(mock_publish.call_count, 0)
+
+    def test_run_publish_tick_bypasses_prime_when_disabled(self):
+        """enforce_prime_time=False ise Prime Time slotu beklenmeden yayinlanabilmeli."""
+        settings = ClipPipelineSettings(
+            auto_upload=True,
+            enforce_prime_time=False,
+            prime_time_slots="18:00, 20:00, 22:00",
+        )
+        fake_info = {"clip_id": "x", "title": "t", "youtube_video_id": "vid123"}
+        with patch.object(clip_publisher, "is_within_publish_window", return_value=True), \
+             patch.object(clip_publisher, "is_prime_time_now", return_value=(False, None)), \
+             patch.object(clip_publisher, "published_today", return_value=0), \
+             patch.object(clip_publisher, "publish_next_ready", return_value=fake_info) as mock_publish:
+            result = clip_publisher.run_publish_tick(settings)
+
+        self.assertEqual(len(result["published"]), 2)
+
     def test_run_publish_tick_respects_quota(self):
         """Kota dolduysa hic yukleme yapilmamali."""
         settings = ClipPipelineSettings(auto_upload=True, daily_shorts_limit=3, daily_horizontal_limit=3)
 
         with patch.object(clip_publisher, "is_within_publish_window", return_value=True), \
+             patch.object(clip_publisher, "is_prime_time_now", return_value=(True, "18:00")), \
              patch.object(clip_publisher, "published_today", return_value=3), \
              patch.object(clip_publisher, "publish_next_ready", return_value=None) as mock_publish:
             result = clip_publisher.run_publish_tick(settings)
 
         self.assertEqual(result["published"], [])
         self.assertEqual(mock_publish.call_count, 0)
+
+    def test_calculate_schedule_zero_quota_no_infinite_loop(self):
+        """Kota 0 veya eksi oldugunda calculate_schedule_for_stock kilitlenmemeli (S9 dogrulamasi)."""
+        settings = ClipPipelineSettings(daily_shorts_limit=1)
+        # daily_limit 0 donerse bile sonsuz donguye girmemeli
+        with patch.object(clip_publisher, "daily_limit", return_value=0):
+            pairs = clip_publisher.calculate_schedule_for_stock(ClipTargetFormat.SHORTS, settings)
+            self.assertIsInstance(pairs, list)
 
 
 if __name__ == "__main__":

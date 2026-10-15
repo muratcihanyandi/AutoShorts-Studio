@@ -111,7 +111,7 @@ class TestStreamerFeed(unittest.TestCase):
             source_key="twitch_abc",
             platform=PlatformType.TWITCH,
             channel_name="elraenn",
-            title="Funny moment",
+            title="Elraenn Komik Anları İzliyor",
             url="https://clips.twitch.tv/abc",
             duration=30,
             view_count=1000,
@@ -133,6 +133,31 @@ class TestStreamerFeed(unittest.TestCase):
         self.assertEqual(by_id["twitch_abc__h"].target_format, ClipTargetFormat.HORIZONTAL)
         # Ikiz ayni kaynagi paylasir -> tek indirme
         self.assertEqual(by_id["twitch_abc"].source_key, by_id["twitch_abc__h"].source_key)
+
+    def test_reaction_filter_blocks_plain_compilation_for_horizontal(self):
+        """Duz funny moments derlemesi yatay icin reddedilmeli, sadece shorts'a izin verilmeli."""
+        fake_clip = ClipItem(
+            clip_id="twitch_plain_comp",
+            source_key="twitch_plain_comp",
+            platform=PlatformType.TWITCH,
+            channel_name="elraenn",
+            title="Valorant Best Moments Derlemesi",
+            url="https://clips.twitch.tv/plain",
+            duration=30,
+            view_count=1000,
+            status=ClipStatus.DISCOVERED,
+        )
+
+        settings = ClipPipelineSettings(youtube_search_enabled=False, filter_horizontal_reactions_only=True)
+        streamer = self._make_streamer([ClipTargetFormat.SHORTS, ClipTargetFormat.HORIZONTAL])
+
+        with patch.object(clip_downloader, "fetch_twitch_clips", return_value=[fake_clip]), \
+             patch.object(clip_downloader, "fetch_twitch_vods", return_value=[]):
+            items = clip_downloader.fetch_streamer_feed(streamer, settings)
+
+        # Duz derleme yatay icin elenmeli, yalnizca Shorts kalmali (1 adet)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].target_format, ClipTargetFormat.SHORTS)
 
     def test_shorts_only_skips_vods_and_youtube(self):
         fake_clip = ClipItem(
@@ -265,6 +290,52 @@ class TestDownloadDedupe(unittest.TestCase):
             if os.path.exists(out_path):
                 os.remove(out_path)
 
+    def test_download_clip_passes_rate_limit(self):
+        source_key = "test_rate_limit_unique_456"
+        out_path = os.path.join(clip_downloader.raw_dir, f"{source_key}.mp4")
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+        clip = ClipItem(
+            clip_id="test_rate_limit_row",
+            source_key=source_key,
+            platform=PlatformType.YOUTUBE,
+            channel_name="test",
+            title="Rate limit test",
+            url="https://youtube.com/watch?v=12345",
+            status=ClipStatus.DISCOVERED,
+        )
+        settings = ClipPipelineSettings(download_rate_limit_mb=5.0)
+
+        with patch("app.services.clip_downloader.subprocess.Popen") as mock_popen, \
+             patch("app.services.clip_downloader.threading.Timer") as mock_timer:
+            mock_proc = unittest.mock.MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = iter(["[download] 100% of 10MiB at 5MiB/s\n"])
+            mock_proc.poll.return_value = 0
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+
+            try:
+                # out_path'in olusturuldugunu simule et
+                with open(out_path, "wb") as f:
+                    f.write(b"video data")
+
+                res = clip_downloader.download_clip(clip, settings=settings)
+                self.assertTrue(mock_popen.called)
+                ytdlp_cmd = mock_popen.call_args_list[0][0][0]
+                self.assertIn("--limit-rate", ytdlp_cmd)
+                idx = ytdlp_cmd.index("--limit-rate")
+                self.assertEqual(ytdlp_cmd[idx + 1], "5M")
+
+                # timer timeout'unun en az 900 sn oldugunu dogrula
+                self.assertTrue(mock_timer.called)
+                timer_duration = mock_timer.call_args[0][0]
+                self.assertEqual(timer_duration, 900)
+            finally:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+
 
 class TestFiltersAndRecency(unittest.TestCase):
     def test_title_blacklist_matches_keywords(self):
@@ -277,18 +348,23 @@ class TestFiltersAndRecency(unittest.TestCase):
         # 1. Taze video (3 gun once) -> kabul
         fresh_date = (datetime.utcnow() - timedelta(days=3)).strftime("%Y%m%d")
         self.assertTrue(clip_downloader._is_video_fresh_or_viral(
-            {"upload_date": fresh_date}, view_count=200, max_age_days=7, viral_threshold=50000
+            {"upload_date": fresh_date}, view_count=200, max_age_days=7, viral_threshold=50000, enable_viral_hunter=False
         ))
 
-        # 2. Eski video (20 gun once) ama cok viral (100.000 izlenme) -> kabul
+        # 2. Eski video (20 gun once) ama cok viral (100.000 izlenme) -> viral hunter ACIKSA kabul
         old_date = (datetime.utcnow() - timedelta(days=20)).strftime("%Y%m%d")
         self.assertTrue(clip_downloader._is_video_fresh_or_viral(
-            {"upload_date": old_date}, view_count=100000, max_age_days=7, viral_threshold=50000
+            {"upload_date": old_date}, view_count=100000, max_age_days=7, viral_threshold=50000, enable_viral_hunter=True
         ))
 
-        # 3. Eski video (20 gun once) ve viral degil (5.000 izlenme) -> red
+        # 3. Eski video (20 gun once) 500.000 izlenme olsa bile viral hunter KAPALIYSA -> KESIN RED
         self.assertFalse(clip_downloader._is_video_fresh_or_viral(
-            {"upload_date": old_date}, view_count=5000, max_age_days=7, viral_threshold=50000
+            {"upload_date": old_date}, view_count=500000, max_age_days=7, viral_threshold=50000, enable_viral_hunter=False
+        ))
+
+        # 4. Eski video (20 gun once) ve viral degil (5.000 izlenme) -> her turlu red
+        self.assertFalse(clip_downloader._is_video_fresh_or_viral(
+            {"upload_date": old_date}, view_count=5000, max_age_days=7, viral_threshold=50000, enable_viral_hunter=True
         ))
 
 

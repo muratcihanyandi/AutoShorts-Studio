@@ -267,8 +267,9 @@ def download_clip(clip_id: str):
     if not clip:
         raise HTTPException(status_code=404, detail="Klip veritabanında bulunamadı.")
     try:
-        raw_path = clip_downloader.download_clip(clip)
-        return {"status": "success", "raw_path": raw_path, "clip_id": clip_id}
+        with clip_scheduler._pipeline_lock:
+            raw_path = clip_downloader.download_clip(clip)
+            return {"status": "success", "raw_path": raw_path, "clip_id": clip_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -312,13 +313,14 @@ def render_shorts(req: RenderShortsRequest):
     settings.subtitle_enabled = req.subtitle_enabled
 
     try:
-        out_path = clip_editor.process_clip_to_shorts(
-            clip,
-            settings=settings,
-            cut_start_sec=req.start_sec,
-            cut_end_sec=req.end_sec
-        )
-        return {"status": "success", "processed_path": out_path, "clip_id": req.clip_id}
+        with clip_scheduler._pipeline_lock:
+            out_path = clip_editor.process_clip_to_shorts(
+                clip,
+                settings=settings,
+                cut_start_sec=req.start_sec,
+                cut_end_sec=req.end_sec
+            )
+            return {"status": "success", "processed_path": out_path, "clip_id": req.clip_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -342,8 +344,9 @@ def publish_to_youtube(req: UploadYouTubeRequest):
     settings.privacy_status = req.privacy_status
 
     try:
-        video_id = shorts_publisher.publish_clip(clip, settings=settings)
-        return {"status": "success", "youtube_video_id": video_id, "url": f"https://youtu.be/{video_id}"}
+        with clip_scheduler._pipeline_lock:
+            video_id = shorts_publisher.publish_clip(clip, settings=settings)
+            return {"status": "success", "youtube_video_id": video_id, "url": f"https://youtu.be/{video_id}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
